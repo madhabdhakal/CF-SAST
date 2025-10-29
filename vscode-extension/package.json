@@ -1,0 +1,104 @@
+{
+  "name": "cfml-sast-scanner",
+  "displayName": "CFML SAST Scanner",
+  "description": "🔒 Professional SAST scanner for ColdFusion (CFML) with enterprise security features. Detects 13+ vulnerability types including SQL injection, XSS, command execution, and unsafe uploads. Features CFScript support, SARIF output, baseline suppression, and .sastignore patterns.",
+  "version": "1.3.1",
+  "publisher": "MadhabDhakal",
+  "icon": "images/icon.png",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Linters",
+    "Testing",
+    "Other"
+  ],
+  "keywords": [
+    "ColdFusion",
+    "CFML",
+    "Security",
+    "SAST",
+    "Static Analysis",
+    "DevSecOps",
+    "Linter"
+  ],
+  "activationEvents": [
+    "onLanguage:cfml",
+    "onCommand:cfmlSast.scanFile",
+    "onCommand:cfmlSast.scanWorkspace",
+    "onCommand:cfmlSast.install",
+    "workspaceContains:**/*.cfm",
+    "workspaceContains:**/*.cfc",
+    "workspaceContains:**/*.cfml"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "cfmlSast.scanFile",
+        "title": "CFML SAST: Scan Current File"
+      },
+      {
+        "command": "cfmlSast.scanWorkspace",
+        "title": "CFML SAST: Scan Changed Files"
+      },
+      {
+        "command": "cfmlSast.install",
+        "title": "CFML SAST: Install Git Hooks"
+      },
+      {
+        "command": "cfmlSast.createBaseline",
+        "title": "CFML SAST: Create Baseline"
+      },
+      {
+        "command": "cfmlSast.createIgnoreFile",
+        "title": "CFML SAST: Create .sastignore File"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "cfmlSast.scanFile",
+          "when": "resourceExtname =~ /\\.(cfm|cfc|cfml)$/",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "cfmlSast.scanFile",
+          "when": "editorLangId == cfml"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CFML SAST Scanner",
+      "properties": {
+        "cfmlSast.outputFormat": {
+          "type": "string",
+          "enum": ["json", "sarif"],
+          "default": "json",
+          "description": "Output format for scan results (SARIF for enterprise tools)"
+        },
+        "cfmlSast.useBaseline": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use baseline file to suppress existing findings"
+        },
+        "cfmlSast.showIgnoredFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show count of files ignored by .sastignore patterns"
+        }
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/madhabdhakal/CF-SAST"
+  },
+  "bugs": {
+    "url": "https://github.com/madhabdhakal/CF-SAST/issues"
+  },
+  "homepage": "https://github.com/madhabdhakal/CF-SAST",
+  "license": "MIT"
+}

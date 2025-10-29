@@ -1,0 +1,13 @@
+# Test files with vulnerabilities
+test/
+samples/
+*vulnerable*
+*debug*
+
+# Temporary files
+*.bak
+test-baseline.json
+
+# IDE files
+.vscode/
+*.log

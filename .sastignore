@@ -1,0 +1,19 @@
+# CFML SAST Ignore Patterns
+
+# Ignore test files
+*test*
+*/tests/*
+
+# Ignore third-party libraries
+*/vendor/*
+*/lib/*
+
+# Ignore generated files
+*generated*
+*.min.cfm
+*.min.cfc
+
+# Ignore development files
+*debug*
+*temp*
+*.bak
