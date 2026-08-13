@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows and macOS are first-class targets: the git hooks and the
+        # VS Code extension both shell out differently on each.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.13']
+        include:
+          - os: ubuntu-latest
+            python: '3.8'
+          - os: ubuntu-latest
+            python: '3.11'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run test suite
+        run: python -m unittest discover -s tests -t tests -v
+
+  self-scan:
+    name: self-scan (SARIF contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Scan fixtures and emit SARIF
+        # The fixtures are deliberately vulnerable, so --fail-on-high is
+        # omitted here; this job exists to prove the SARIF document is
+        # well-formed and uses repo-relative URIs.
+        run: python scripts/cfml_sast_simple.py --scan-all --sarif > results.sarif
+      - name: Validate SARIF is parseable and relative
+        run: |
+          python - <<'PY'
+          import json, sys
+          doc = json.load(open('results.sarif'))
+          assert doc['version'] == '2.1.0', doc.get('version')
+          uris = [
+              r['locations'][0]['physicalLocation']['artifactLocation']['uri']
+              for r in doc['runs'][0]['results']
+          ]
+          assert uris, 'expected findings from the fixture corpus'
+          bad = [u for u in uris if u.startswith('/') or ':' in u]
+          assert not bad, f'non-relative URIs in SARIF: {bad[:5]}'
+          print(f'{len(uris)} findings, all repo-relative')
+          PY
+
+  shellcheck:
+    name: shellcheck (git hooks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint shell hooks
+        run: shellcheck scripts/sast/prepush.sh
+
+  powershell:
+    name: powershell wrapper
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse scan_project.ps1
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path ./scan_project.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors) {
+              $errors | ForEach-Object { Write-Error $_.Message }
+              exit 1
+          }
+          Write-Host 'scan_project.ps1 parses cleanly'
+      - name: Smoke-test the wrapper end to end
+        shell: pwsh
+        run: |
+          # Fixtures are intentionally vulnerable, so a non-zero exit is
+          # expected; the point is that the wrapper runs and writes valid,
+          # BOM-free JSON.
+          ./scan_project.ps1 -OutputFormat json -OutputFile out.json
+          $bytes = [System.IO.File]::ReadAllBytes("$PWD/out.json")
+          if ($bytes[0] -eq 0xEF -or $bytes[0] -eq 0xFF -or $bytes[0] -eq 0xFE) {
+              throw 'output file has a BOM; downstream JSON parsers will choke'
+          }
+          Get-Content out.json -Raw | ConvertFrom-Json | Out-Null
+          Write-Host 'wrapper produced valid BOM-free JSON'
+
+  extension:
+    name: vscode extension syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Parse extension sources
+        run: node --check vscode-extension/extension.js
+      - name: Validate package manifest
+        run: node -e "JSON.parse(require('fs').readFileSync('vscode-extension/package.json','utf8'))"
+      - name: Unit tests
+        run: node --test vscode-extension/test/extension.test.js

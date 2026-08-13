@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import bisect
 import re
 import sys
 import argparse
@@ -7,14 +8,113 @@ import shutil
 import time
 from pathlib import Path
 
+# A <cfquery> block and its body. Non-greedy so adjacent queries stay distinct.
+CFQUERY_BLOCK = re.compile(r'<cfquery\b[^>]*>(.*?)</cfquery\s*>', re.IGNORECASE | re.DOTALL)
+# Regions inside a query body where interpolation is safe or inert.
+CFQUERYPARAM_TAG = re.compile(r'<cfqueryparam\b[^>]*>', re.IGNORECASE)
+CFML_COMMENT = re.compile(r'<!---.*?--->', re.DOTALL)
+# A #...# interpolation. Bounded and newline-free: CFML expressions do not
+# span lines, and bounding it keeps the scan linear.
+CFML_INTERPOLATION = re.compile(r'#[^#\r\n]{1,200}#')
+
+
+def find_unparameterized_sql(content):
+    """Yield each #...# interpolation inside a <cfquery> that is not bound.
+
+    Evaluating interpolations individually is the whole point. Asking merely
+    whether the block contains a <cfqueryparam> anywhere misses the dominant
+    real-world shape, where a developer parameterizes most of a query and
+    leaves one clause concatenated:
+
+        WHERE id = <cfqueryparam value="#url.id#" ...>
+          AND name = '#url.name#'          <-- still injectable
+
+    Interpolation inside a cfqueryparam value attribute is bound and safe;
+    interpolation inside a CFML comment is inert. Everything else in the
+    query body reaches the database as literal SQL text.
+    """
+    for block in CFQUERY_BLOCK.finditer(content):
+        body = block.group(1)
+        body_offset = block.start(1)
+
+        safe_spans = [m.span() for m in CFQUERYPARAM_TAG.finditer(body)]
+        safe_spans += [m.span() for m in CFML_COMMENT.finditer(body)]
+
+        for interp in CFML_INTERPOLATION.finditer(body):
+            if any(lo <= interp.start() < hi for lo, hi in safe_spans):
+                continue
+            yield body_offset + interp.start(), interp.group()
+
+
+CFXML_BLOCK = re.compile(r'<cfxml\b[^>]*>(.*?)</cfxml\s*>', re.IGNORECASE | re.DOTALL)
+ENTITY_DECL = re.compile(r'<!ENTITY\b', re.IGNORECASE)
+
+
+def find_xxe(content):
+    """Yield <cfxml> blocks that declare an internal entity.
+
+    Checking the block for an <!ENTITY declaration is order-independent. The
+    previous pattern demanded that <!DOCTYPE follow the opening tag with only
+    whitespace between, so an XML declaration or a comment ahead of the
+    doctype defeated it.
+    """
+    for block in CFXML_BLOCK.finditer(content):
+        if ENTITY_DECL.search(block.group(1)):
+            yield block.start(), block.group()[:100]
+
+
+# Request-scoped, attacker-controlled variable scopes.
+UNTRUSTED_SCOPE = re.compile(r'\b(?:form|url)\s*\.', re.IGNORECASE)
+# Output encoders that neutralise an interpolated value.
+OUTPUT_ENCODER = re.compile(
+    r'\b(?:encodeFor\w+|htmlEditFormat|htmlCodeFormat|xmlFormat|jsStringFormat)\s*\(',
+    re.IGNORECASE)
+
+
+def find_unencoded_output(content):
+    """Yield interpolations of form/url scope that are not passed through an encoder.
+
+    The previous pattern `#(form|url)\\.[^#]+#` could only ever match a bare
+    `#form.x#`, so its EncodeForHTML() exclusion was unreachable dead code:
+    `#EncodeForHTML(form.x)#` did not match the pattern in the first place.
+
+    Matching any interpolation that *references* an untrusted scope and then
+    excluding the encoded ones makes the exclusion meaningful, and it catches
+    partially-processed cases such as `#trim(form.x)#` that the old pattern
+    silently let through.
+
+    Interpolation inside a <cfquery> is SQL, not markup: it is reported by
+    CF-SQLI-001 instead of being double-counted here.
+    """
+    inert_spans = [m.span() for m in CFQUERY_BLOCK.finditer(content)]
+    inert_spans += [m.span() for m in CFML_COMMENT.finditer(content)]
+
+    for interp in CFML_INTERPOLATION.finditer(content):
+        text = interp.group()
+        if not UNTRUSTED_SCOPE.search(text):
+            continue
+        if OUTPUT_ENCODER.search(text):
+            continue
+        if any(lo <= interp.start() < hi for lo, hi in inert_spans):
+            continue
+        yield interp.start(), text
+
+
 class CFMLSASTScanner:
-    def __init__(self):
+    # Display and gating order. Also drives SARIF level mapping.
+    SEVERITY_RANK = {'HIGH': 0, 'MEDIUM': 1, 'LOW': 2}
+
+    def __init__(self, max_scan_time=300):
         # Security and performance limits
         self.max_file_size = 5 * 1024 * 1024  # 5MB
         self.max_findings = 10000  # Prevent memory exhaustion
         self.scan_start_time = time.time()
-        self.max_scan_time = 300  # 5 minutes timeout
-        
+        self.max_scan_time = max_scan_time
+        # Latched when a limit cuts the scan short. Callers must not report an
+        # incomplete scan as a clean one.
+        self.incomplete = False
+
+
         # Load ignore patterns
         self.ignore_patterns = self.load_ignore_patterns()
         
@@ -24,31 +124,45 @@ class CFMLSASTScanner:
                 'id': 'CF-SQLI-001',
                 'name': 'SQL Injection',
                 'severity': 'HIGH',
-                'pattern': re.compile(r'<cfquery[^>]*>.*?#[^#]+#.*?</cfquery>', re.IGNORECASE | re.DOTALL),
-                'exclude': re.compile(r'<cfqueryparam', re.IGNORECASE),
-                'description': 'Possible SQL Injection (<cfquery> without <cfqueryparam>)'
+                # Needs per-interpolation analysis, not a whole-block regex.
+                'finder': find_unparameterized_sql,
+                'pattern': None,
+                'exclude': None,
+                'description': 'Possible SQL Injection (unparameterized value in <cfquery>)'
             },
             {
                 'id': 'CF-XSS-001',
                 'name': 'XSS',
                 'severity': 'MEDIUM',
-                'pattern': re.compile(r'#(form|url)\.[^#]+#', re.IGNORECASE),
-                'exclude': re.compile(r'EncodeForHTML\(', re.IGNORECASE),
+                # Encoder detection has to inspect the interpolation contents.
+                'finder': find_unencoded_output,
+                'pattern': None,
+                'exclude': None,
                 'description': 'Potential XSS (form/url variable unencoded)'
             },
             {
                 'id': 'CF-UPLOAD-001',
                 'name': 'Unsafe Upload',
                 'severity': 'HIGH',
-                'pattern': re.compile(r'<cffile\s+action\s*=\s*["\']upload["\'][^>]*>', re.IGNORECASE),
-                'exclude': re.compile(r'accept\s*=|nameconflict\s*=', re.IGNORECASE),
+                # action= may appear at any position in the tag, not just first.
+                'pattern': re.compile(r'<cffile\b[^>]*\baction\s*=\s*["\']upload["\'][^>]*>', re.IGNORECASE),
+                # Only an accept= allow-list mitigates this. nameconflict=
+                # controls overwrite behaviour and was previously suppressing
+                # genuine findings.
+                'exclude': re.compile(r'\baccept\s*=', re.IGNORECASE),
                 'description': 'Unsafe file upload without validation'
             },
             {
                 'id': 'CF-EXEC-001',
                 'name': 'Command Execution',
                 'severity': 'HIGH',
-                'pattern': re.compile(r'(<cfexecute|Runtime\.exec)', re.IGNORECASE),
+                # The literal "Runtime.exec" almost never appears in real CFML;
+                # the idiomatic form is createObject(...).getRuntime().exec().
+                'pattern': re.compile(
+                    r'(?:<cfexecute\b'
+                    r'|\bRuntime\s*\.\s*exec\s*\('
+                    r'|\bgetRuntime\s*\(\s*\)\s*\.\s*exec\s*\()',
+                    re.IGNORECASE),
                 'exclude': None,
                 'description': 'Command execution detected'
             },
@@ -64,7 +178,10 @@ class CFMLSASTScanner:
                 'id': 'CF-CRYPTO-001',
                 'name': 'Weak Crypto',
                 'severity': 'LOW',
-                'pattern': re.compile(r'(MessageDigest|MD5|SHA1)', re.IGNORECASE),
+                # Word-bounded so identifiers such as sha1Hash or md5sumColumn
+                # are not reported, and hyphenated spellings ("SHA-1", the form
+                # ColdFusion's hash() actually takes) are.
+                'pattern': re.compile(r'\b(?:MessageDigest|MD-?5|SHA-?1)\b', re.IGNORECASE),
                 'exclude': None,
                 'description': 'Weak cryptographic algorithm'
             },
@@ -109,14 +226,12 @@ class CFMLSASTScanner:
                 'exclude': None,
                 'description': 'Dynamic include in CFScript'
             },
-            {
-                'id': 'CF-EVAL-002',
-                'name': 'CFScript Eval',
-                'severity': 'MEDIUM',
-                'pattern': re.compile(r'evaluate\s*\([^)]*[+&].*?\)', re.IGNORECASE),
-                'exclude': None,
-                'description': 'Dynamic evaluation in CFScript'
-            },
+            # CF-EVAL-002 (retired): its pattern was a strict subset of
+            # CF-EVAL-001, so every match it produced was a duplicate finding
+            # on the same line. Unlike the EXEC and INCLUDE pairs, evaluate()
+            # is spelled identically in tag and script context, so there was
+            # no CFScript variant to detect. The ID stays retired rather than
+            # being reused, so old baselines remain unambiguous.
             # Additional security rules
             {
                 'id': 'CF-LDAP-001',
@@ -130,7 +245,8 @@ class CFMLSASTScanner:
                 'id': 'CF-XXE-001',
                 'name': 'XXE Attack',
                 'severity': 'HIGH',
-                'pattern': re.compile(r'<cfxml[^>]*>\s*<!DOCTYPE[^>]*ENTITY', re.IGNORECASE | re.DOTALL),
+                'finder': find_xxe,
+                'pattern': None,
                 'exclude': None,
                 'description': 'XML External Entity (XXE) vulnerability'
             },
@@ -165,6 +281,91 @@ class CFMLSASTScanner:
             print(f"Warning: Error loading .sastignore: {e}", file=sys.stderr)
         return ignore_patterns
     
+    def budget_exceeded(self):
+        """Whether a resource limit has cut the scan short.
+
+        Latches so the message is printed once and every later call is cheap.
+        Callers treat this as fatal to the run rather than to a single file:
+        continuing would produce a partial result set indistinguishable from
+        a clean scan.
+        """
+        if self.incomplete:
+            return True
+        if time.time() - self.scan_start_time > self.max_scan_time:
+            self.incomplete = True
+            print(f"Warning: Scan timeout reached after {self.max_scan_time}s; "
+                  f"results are INCOMPLETE", file=sys.stderr)
+        elif len(self.findings) >= self.max_findings:
+            self.incomplete = True
+            print(f"Warning: Maximum findings limit reached ({self.max_findings}); "
+                  f"results are INCOMPLETE", file=sys.stderr)
+        return self.incomplete
+
+    @staticmethod
+    def build_line_index(content):
+        """Offsets at which each line begins, for O(log n) line lookup."""
+        starts = [0]
+        for i, ch in enumerate(content):
+            if ch == '\n':
+                starts.append(i + 1)
+        return starts
+
+    @staticmethod
+    def line_of_offset(line_starts, offset):
+        """1-based line number containing the given character offset."""
+        return bisect.bisect_right(line_starts, offset)
+
+    def rule_matches(self, rule, content):
+        """Yield (offset, matched_text) pairs for one rule against one file.
+
+        A rule is expressed either as a regex with an optional exclusion, or
+        as a `finder` callable for logic regexes cannot express (see
+        find_unparameterized_sql). Exclusions are evaluated against the scope
+        named by `exclude_scope`:
+
+          'match' - the matched text itself
+          'line'  - the whole source line the match starts on
+
+        'line' exists because most mitigations sit adjacent to the sink
+        rather than inside it: EncodeForHTML() wraps the variable, so it can
+        never appear within a `#form.x#` match.
+        """
+        finder = rule.get('finder')
+        if finder is not None:
+            for start, text in finder(content):
+                yield start, text
+            return
+
+        exclude = rule.get('exclude')
+        scope = rule.get('exclude_scope', 'match')
+        for match in rule['pattern'].finditer(content):
+            if exclude is not None:
+                if scope == 'line':
+                    line_start = content.rfind('\n', 0, match.start()) + 1
+                    line_end = content.find('\n', match.end())
+                    haystack = content[line_start:line_end if line_end != -1 else len(content)]
+                else:
+                    haystack = match.group()
+                if exclude.search(haystack):
+                    continue
+            yield match.start(), match.group()
+
+    def relative_path(self, file_path):
+        """Render a path relative to the scan root using forward slashes.
+
+        Findings are reported and keyed in this form so that baselines stay
+        valid across machines and CI checkouts, and so that SARIF
+        artifactLocation URIs anchor correctly in GitHub code scanning
+        (which resolves them against the repository root).
+        """
+        try:
+            resolved = Path(file_path).resolve()
+            return resolved.relative_to(Path.cwd().resolve()).as_posix()
+        except (ValueError, OSError):
+            # Outside the scan root, or unresolvable: fall back to the input
+            # rather than inventing a path.
+            return Path(file_path).as_posix()
+
     def should_ignore_file(self, file_path):
         """Check if file should be ignored based on .sastignore patterns"""
         file_str = str(file_path).replace('\\', '/')
@@ -193,10 +394,13 @@ class CFMLSASTScanner:
             if not isinstance(file_path, (str, Path)):
                 return
             
-            # Sanitize input path
-            clean_path = str(file_path).replace('..', '').replace('~', '')
-            resolved_path = Path(clean_path).resolve()
-            
+            # resolve() normalises ".." segments and symlinks; the
+            # relative_to() check below is what actually confines the scan.
+            # Do not pre-strip ".." or "~" from the string: that corrupts
+            # legitimate filenames (report..v2.cfm, draft~1.cfm) and makes
+            # them silently unscannable.
+            resolved_path = Path(file_path).resolve()
+
             # Security: Only allow files within current directory tree
             cwd = Path.cwd().resolve()
             try:
@@ -205,21 +409,22 @@ class CFMLSASTScanner:
                 print(f"Security: Blocked path traversal attempt: {file_path}", file=sys.stderr)
                 return
             
+            # Every downstream consumer sees this project-relative form.
+            rel_path = self.relative_path(resolved_path)
+
             # Check if file should be ignored
-            if self.should_ignore_file(file_path):
+            if self.should_ignore_file(rel_path):
                 return
-            
+
             # Skip very large files for performance
             file_size = resolved_path.stat().st_size
             if file_size > self.max_file_size:
                 print(f"Warning: Skipping large file {file_path} ({file_size // 1024 // 1024}MB > {self.max_file_size // 1024 // 1024}MB)", file=sys.stderr)
                 return
             
-            # Check scan timeout
-            if time.time() - self.scan_start_time > self.max_scan_time:
-                print("Warning: Scan timeout reached", file=sys.stderr)
+            if self.budget_exceeded():
                 return
-            
+
             with open(resolved_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
         except (FileNotFoundError, PermissionError):
@@ -232,20 +437,21 @@ class CFMLSASTScanner:
             print(f"Error scanning {file_path}: {e}", file=sys.stderr)
             return
 
+        # Precomputed once per file: turning an offset into a line number by
+        # counting newlines in a prefix is O(file) per finding, which becomes
+        # quadratic on large files with many findings.
+        line_starts = self.build_line_index(content)
+
         for rule in self.rules:
             try:
-                # Use pre-compiled pattern for better performance
-                matches = rule['pattern'].finditer(content)
-                for match in matches:
+                for start, matched_text in self.rule_matches(rule, content):
                     try:
-                        if rule['exclude'] and rule['exclude'].search(match.group()):
-                            continue
-                        
-                        line_num = content[:match.start()].count('\n') + 1
+                        line_num = self.line_of_offset(line_starts, start)
                         # Sanitize finding data
-                        safe_file = str(file_path)[:500]
-                        safe_match = match.group()[:100].replace('\n', '\\n').replace('\r', '\\r')
-                        
+                        safe_file = rel_path[:500]
+                        safe_match = matched_text[:100].replace('\n', '\\n').replace('\r', '\\r')
+
+
                         finding = {
                             'file': safe_file,
                             'line': max(1, min(line_num, 999999)),  # Validate line number
@@ -257,16 +463,11 @@ class CFMLSASTScanner:
                         
                         # Check if finding should be ignored
                         if not self.should_ignore_finding(finding):
-                            # Prevent memory exhaustion
-                            if len(self.findings) >= self.max_findings:
-                                print(f"Warning: Maximum findings limit reached ({self.max_findings})", file=sys.stderr)
+                            # Checked per match: this is the finest granularity
+                            # available without interrupting a regex mid-run.
+                            if self.budget_exceeded():
                                 return
-                            
-                            # Check scan timeout
-                            if time.time() - self.scan_start_time > self.max_scan_time:
-                                print("Warning: Scan timeout reached", file=sys.stderr)
-                                return
-                            
+
                             self.findings.append(finding)
                     except Exception as e:
                         print(f"Warning: Error processing match in {file_path}: {e}", file=sys.stderr)
@@ -277,23 +478,32 @@ class CFMLSASTScanner:
 
     def scan_files(self, file_paths):
         cfml_extensions = {'.cfm', '.cfc', '.cfml', '.cfinclude'}
-        self.scanned_count = 0
+        # scanned_count accumulates across calls: --scan-all invokes this once
+        # per 50-file batch, and resetting here would report only the last one.
+        batch_scanned = 0
         max_files = 10000  # Prevent DoS attacks
-        
+
+
         if len(file_paths) > max_files:
             print(f"Error: Too many files specified (max: {max_files})", file=sys.stderr)
             return
         
         for file_path in file_paths:
+            # Stop outright rather than looping over the remainder producing
+            # nothing: a partial result set must not masquerade as a clean run.
+            if self.budget_exceeded():
+                break
+
             try:
                 # Input validation
-                if not isinstance(file_path, (str, Path)) or len(str(file_path)) > 500:
+                if not isinstance(file_path, (str, Path)):
                     continue
-                
-                # Sanitize path
-                clean_path = str(file_path).replace('..', '').replace('~', '')
-                path = Path(clean_path).resolve()
-                
+
+                # See scan_file(): resolve() plus the relative_to() check below
+                # is the confinement mechanism. No string pre-stripping.
+                path = Path(file_path).resolve()
+
+
                 # Security: Only scan files within current directory
                 try:
                     path.relative_to(Path.cwd().resolve())
@@ -305,6 +515,7 @@ class CFMLSASTScanner:
                 if (path_ok and path.exists() and path.is_file() and path.suffix.lower() in cfml_extensions):
                     self.scan_file(path)
                     self.scanned_count += 1
+                    batch_scanned += 1
                 elif not path.exists():
                     safe_path = str(file_path)[:100]  # Truncate for safety
                     print(f"Warning: File not found: {safe_path}", file=sys.stderr)
@@ -316,25 +527,35 @@ class CFMLSASTScanner:
                 print(f"Error processing {safe_path}: {str(e)[:200]}", file=sys.stderr)
                 continue
         
-        if self.scanned_count == 0:
+        if batch_scanned == 0:
             print("Warning: No valid CFML files were scanned", file=sys.stderr)
+
+    def has_high_severity(self):
+        """Whether any HIGH finding survived ignore and baseline filtering.
+
+        Kept separate from print_results so that the --fail-on-high exit code
+        is decided by the findings alone and never by the output format.
+        """
+        if not isinstance(self.findings, list):
+            return False
+        return any(isinstance(f, dict) and f.get('severity') == 'HIGH' for f in self.findings)
 
     def print_results(self, json_output=False, sarif_output=False):
         try:
             # Validate findings data
             if not isinstance(self.findings, list):
                 print("Error: Invalid findings data", file=sys.stderr)
-                return False
-            
+                return
+
             if sarif_output:
                 sarif_data = self.generate_sarif()
                 if sarif_data:
                     print(json.dumps(sarif_data, indent=2, ensure_ascii=True))
-                return False
-            
+                return
+
             if json_output:
                 print(json.dumps(self.findings, indent=2, ensure_ascii=True))
-                return False
+                return
 
             # Count findings safely
             high = sum(1 for f in self.findings if isinstance(f, dict) and f.get('severity') == 'HIGH')
@@ -347,7 +568,13 @@ class CFMLSASTScanner:
 
             # Sort and display findings safely
             valid_findings = [f for f in self.findings if isinstance(f, dict) and all(k in f for k in ['severity', 'file', 'line'])]
-            for finding in sorted(valid_findings, key=lambda x: (x['severity'], x['file'], x['line'])):
+            # Sort by severity rank, not alphabetically: sorting the strings
+            # directly yields HIGH, LOW, MEDIUM and buries the middle tier.
+            def sort_key(f):
+                return (self.SEVERITY_RANK.get(f['severity'], len(self.SEVERITY_RANK)),
+                        f['file'], f['line'])
+
+            for finding in sorted(valid_findings, key=sort_key):
                 try:
                     # Sanitize output to prevent injection
                     safe_file = str(finding['file']).replace('\n', '').replace('\r', '')[:200]
@@ -359,11 +586,9 @@ class CFMLSASTScanner:
                     continue
 
             print("Scan complete.")
-            return high > 0
         except Exception as e:
             safe_error = str(e)[:200].replace('\n', ' ').replace('\r', ' ')
             print(f"Error generating results: {safe_error}", file=sys.stderr)
-            return False
     
     def generate_sarif(self):
         """Generate SARIF 2.1.0 format output"""
@@ -520,7 +745,8 @@ class CFMLSASTScanner:
             with open(baseline_path, 'w', encoding='utf-8') as f:
                 json.dump(self.findings, f, indent=2, ensure_ascii=True)
             
-            print(f"Baseline updated: {len(self.findings)} findings saved to {baseline_file}")
+            print(f"Baseline updated: {len(self.findings)} findings saved to {baseline_file}",
+                  file=sys.stderr)
             return 0
         except Exception as e:
             print(f"Error updating baseline: {e}", file=sys.stderr)
@@ -538,7 +764,11 @@ def main():
         parser.add_argument('--init-ignore', action='store_true', help='Create default .sastignore file')
         parser.add_argument('--baseline', metavar='FILE', help='Create or use baseline file to suppress existing findings')
         parser.add_argument('--update-baseline', action='store_true', help='Update existing baseline with current findings')
-        
+        parser.add_argument('--timeout', type=int, default=300, metavar='SECONDS',
+                            help='Wall-clock budget for the scan (default: 300). '
+                                 'Exceeding it exits 2 to mark results incomplete.')
+
+
         args = parser.parse_args()
         
         # Handle --init-ignore flag
@@ -572,7 +802,7 @@ def main():
             print("Error: No valid files specified", file=sys.stderr)
             return 1
 
-        scanner = CFMLSASTScanner()
+        scanner = CFMLSASTScanner(max_scan_time=args.timeout)
         scanner.scan_files(safe_files)
         
         # Handle baseline operations
@@ -582,10 +812,14 @@ def main():
             else:
                 scanner.apply_baseline(args.baseline)
         
-        has_high = scanner.print_results(args.json_out, args.sarif)
-        
-        if args.fail_on_high and has_high:
+        scanner.print_results(args.json_out, args.sarif)
+
+        if args.fail_on_high and scanner.has_high_severity():
             return 1
+        # Exit 2 distinguishes "scan did not finish" from "scan found nothing",
+        # so a pipeline cannot read a truncated run as a pass.
+        if scanner.incomplete:
+            return 2
         return 0
     except KeyboardInterrupt:
         print("\nScan interrupted by user", file=sys.stderr)
@@ -693,14 +927,16 @@ def scan_changed_files(args):
             print("Error: Not a Git repository or Git not available", file=sys.stderr)
             return 1
         
+        # Status text goes to stderr so that stdout stays a clean JSON/SARIF
+        # payload for CI pipelines and the VS Code extension.
         if not cfml_files:
-            print("No changed CFML files found")
+            print("No changed CFML files found", file=sys.stderr)
             return 0
-        
-        print(f"Found {len(cfml_files)} changed CFML files")
+
+        print(f"Found {len(cfml_files)} changed CFML files", file=sys.stderr)
         
         # Process files (batch if needed)
-        scanner = CFMLSASTScanner()
+        scanner = CFMLSASTScanner(max_scan_time=args.timeout)
         if len(cfml_files) > 50:
             batch_size = 50
             for i in range(0, len(cfml_files), batch_size):
@@ -716,10 +952,14 @@ def scan_changed_files(args):
             else:
                 scanner.apply_baseline(args.baseline)
         
-        has_high = scanner.print_results(args.json_out, args.sarif)
-        
-        if args.fail_on_high and has_high:
+        scanner.print_results(args.json_out, args.sarif)
+
+        if args.fail_on_high and scanner.has_high_severity():
             return 1
+        # Exit 2 distinguishes "scan did not finish" from "scan found nothing",
+        # so a pipeline cannot read a truncated run as a pass.
+        if scanner.incomplete:
+            return 2
         return 0
         
     except Exception as e:
@@ -744,15 +984,16 @@ def scan_all_files(args):
             print("No CFML files found in current directory", file=sys.stderr)
             return 1
         
-        print(f"Found {len(all_files)} CFML files. Processing in batches...")
-        
+        print(f"Found {len(all_files)} CFML files. Processing in batches...", file=sys.stderr)
+
         # Process in batches to avoid command line length issues
         batch_size = 50
-        scanner = CFMLSASTScanner()
-        
+        scanner = CFMLSASTScanner(max_scan_time=args.timeout)
+
         for i in range(0, len(all_files), batch_size):
             batch = all_files[i:i + batch_size]
-            print(f"Processing batch {i//batch_size + 1}/{(len(all_files) + batch_size - 1)//batch_size}...")
+            print(f"Processing batch {i//batch_size + 1}/{(len(all_files) + batch_size - 1)//batch_size}...",
+                  file=sys.stderr)
             scanner.scan_files(batch)
         
         # Handle baseline operations
@@ -762,10 +1003,14 @@ def scan_all_files(args):
             else:
                 scanner.apply_baseline(args.baseline)
         
-        has_high = scanner.print_results(args.json_out, args.sarif)
-        
-        if args.fail_on_high and has_high:
+        scanner.print_results(args.json_out, args.sarif)
+
+        if args.fail_on_high and scanner.has_high_severity():
             return 1
+        # Exit 2 distinguishes "scan did not finish" from "scan found nothing",
+        # so a pipeline cannot read a truncated run as a pass.
+        if scanner.incomplete:
+            return 2
         return 0
         
     except Exception as e:

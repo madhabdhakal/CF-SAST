@@ -1,331 +1,346 @@
 # CFML SAST Scanner
 
-🔒 **Professional security scanner for ColdFusion applications with enterprise features**
+🔒 **Static analysis for ColdFusion (CFML) applications**
 
+[![CI](https://github.com/madhabdhakal/CF-SAST/actions/workflows/ci.yml/badge.svg)](https://github.com/madhabdhakal/CF-SAST/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.6+](https://img.shields.io/badge/python-3.6+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![VS Code Extension](https://img.shields.io/badge/VS%20Code-Extension-blue.svg)](https://marketplace.visualstudio.com/items?itemName=MadhabDhakal.cfml-sast-scanner)
 
 ## 🚀 Features
 
-- **🔍 Comprehensive Security Rules** - 16+ vulnerability detection patterns
-- **⚡ Zero Dependencies** - Uses only Python standard library
-- **🎯 Git-Aware Scanning** - Scans only changed/modified files
-- **📝 CFScript Support** - Detects modern CFML syntax vulnerabilities
-- **🏢 Enterprise Ready** - SARIF 2.1.0 output, baseline suppression, ignore patterns
-- **🔧 VS Code Extension** - Professional IDE integration with visual results
-- **📊 Multiple Output Formats** - Console, JSON, and SARIF output
-- **🛡️ Security Hardened** - Path traversal protection, input validation, timeout controls
-- **📈 Performance Optimized** - File size limits, scan timeouts, memory management
+- **🔍 14 security rules** covering tag-based and CFScript CFML
+- **⚡ Zero dependencies** — Python standard library only
+- **🎯 Git-aware scanning** — scan only changed files
+- **📊 Console, JSON and SARIF 2.1.0 output**
+- **🏢 Baseline suppression and `.sastignore` patterns** for adopting the tool on an existing codebase
+- **🔧 VS Code extension** with a results panel
+- **🪝 Pre-push git hook** for Windows, macOS and Linux
 
 ## 🔐 Security Rules
 
-### Tag-Based CFML Detection
-| Rule ID | Severity | Description |
-|---------|----------|-------------|
-| **CF-SQLI-001** | 🔴 HIGH | SQL Injection in `<cfquery>` without `<cfqueryparam>` |
-| **CF-XSS-001** | 🟡 MEDIUM | Unencoded form/url variables (missing `EncodeForHTML()`) |
-| **CF-UPLOAD-001** | 🔴 HIGH | Unsafe file uploads without validation |
-| **CF-EXEC-001** | 🔴 HIGH | Command execution via `<cfexecute>` or `Runtime.exec` |
-| **CF-INCLUDE-001** | 🟡 MEDIUM | Dynamic includes with user input |
-| **CF-CRYPTO-001** | 🔵 LOW | Weak cryptographic algorithms (MD5, SHA1) |
-| **CF-EVAL-001** | 🟡 MEDIUM | Dynamic code evaluation with `evaluate()` |
-| **CF-LDAP-001** | 🔴 HIGH | LDAP injection vulnerabilities |
-| **CF-XXE-001** | 🔴 HIGH | XML External Entity (XXE) attacks |
-| **CF-TRAVERSAL-001** | 🔴 HIGH | Directory traversal in file operations |
+### Tag-based CFML
 
-### CFScript Detection
 | Rule ID | Severity | Description |
 |---------|----------|-------------|
-| **CF-SQLI-002** | 🔴 HIGH | SQL Injection in `queryExecute()` without params |
-| **CF-XSS-002** | 🟡 MEDIUM | Unencoded output in `writeOutput()` |
+| **CF-SQLI-001** | 🔴 HIGH | Unparameterized value interpolated into a `<cfquery>` |
+| **CF-XSS-001** | 🟡 MEDIUM | `form`/`url` value output without an encoder |
+| **CF-UPLOAD-001** | 🔴 HIGH | `<cffile action="upload">` without an `accept` allow-list |
+| **CF-EXEC-001** | 🔴 HIGH | Command execution via `<cfexecute>` or `Runtime.exec()` |
+| **CF-INCLUDE-001** | 🟡 MEDIUM | `<cfinclude>` with an interpolated template path |
+| **CF-CRYPTO-001** | 🔵 LOW | Weak hash algorithm (MD5, SHA-1, `MessageDigest`) |
+| **CF-EVAL-001** | 🟡 MEDIUM | Dynamic code evaluation via `evaluate()` |
+| **CF-LDAP-001** | 🔴 HIGH | `<cfldap>` filter built from interpolation or concatenation |
+| **CF-XXE-001** | 🔴 HIGH | `<cfxml>` block declaring an internal entity |
+| **CF-TRAVERSAL-001** | 🔴 HIGH | `<cffile>` destination containing a traversal sequence |
+
+### CFScript
+
+| Rule ID | Severity | Description |
+|---------|----------|-------------|
+| **CF-SQLI-002** | 🔴 HIGH | `queryExecute()` built by concatenation instead of bound params |
+| **CF-XSS-002** | 🟡 MEDIUM | `writeOutput()` of a `form`/`url`/`arguments` value |
 | **CF-EXEC-002** | 🔴 HIGH | Command execution via `cfexecute()` |
-| **CF-INCLUDE-002** | 🟡 MEDIUM | Dynamic includes in CFScript |
-| **CF-EVAL-002** | 🟡 MEDIUM | Dynamic evaluation in CFScript |
+| **CF-INCLUDE-002** | 🟡 MEDIUM | `include()` with a concatenated path |
+
+> **CF-EVAL-002 is retired.** Its pattern was a strict subset of CF-EVAL-001, so
+> it only ever produced duplicate findings on the same line. `evaluate()` is
+> spelled identically in tag and script context, so there was no CFScript
+> variant to detect. The ID is not reused.
+
+### What CF-SQLI-001 does and does not catch
+
+The rule inspects each `#...#` interpolation in a query body individually. A
+value bound through `<cfqueryparam>` is safe; anything else reaches the
+database as literal SQL. This is what lets it catch the most common real-world
+shape, where most of a query is parameterized and one clause is not:
+
+```cfml
+<cfquery name="findUser" datasource="ds">
+    SELECT * FROM users
+    WHERE id = <cfqueryparam value="#url.id#" cfsqltype="cf_sql_integer">
+      AND name = '#url.name#'      <!--- reported: still injectable --->
+</cfquery>
+```
+
+Like any regex-based scanner this is a lint, not a proof. It does no data-flow
+analysis, so it cannot tell a sanitized variable from a tainted one once the
+value has been assigned to a local.
 
 ## 📦 Installation
 
-### Option 1: One-Click Install (Recommended)
-```bash
-# Navigate to your ColdFusion project
-cd C:\path\to\your-coldfusion-project
+### Option 1: Installer (recommended)
 
-# Download and run secure installer
-py -3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/madhabdhakal/CF-SAST/main/install.py', 'install.py')"
+Run this from the root of your ColdFusion project. It downloads the scanner
+into `CFSAST/` and installs a pre-push hook if the directory is a git
+repository.
+
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/madhabdhakal/CF-SAST/main/install.py -o install.py
+python3 install.py
+```
+
+```powershell
+# Windows (PowerShell)
+curl.exe -fsSL https://raw.githubusercontent.com/madhabdhakal/CF-SAST/main/install.py -o install.py
 py -3 install.py
 ```
 
-### Option 2: VS Code Extension (Professional)
-1. Install **"CFML SAST Scanner"** from VS Code Marketplace
-2. Open Command Palette (`Ctrl+Shift+P`)
-3. Run: `CFML SAST: Install Git Hooks`
-4. Start scanning files with right-click context menu!
+### Option 2: VS Code extension
 
-### Option 3: Manual Installation
+1. Install **"CFML SAST Scanner"** from the VS Code Marketplace
+2. Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`)
+3. Run **CFML SAST: Install Git Hooks**
+4. Right-click any `.cfm`/`.cfc`/`.cfml` file to scan it
+
+### Option 3: Clone the repository
+
 ```bash
-# Create CFSAST folder
-mkdir CFSAST
-
-# Download scanner with integrity verification
-py -3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/madhabdhakal/CF-SAST/main/scripts/cfml_sast_simple.py', 'CFSAST/cfml_sast_simple.py')"
-
-# Test installation
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm
+git clone https://github.com/madhabdhakal/CF-SAST.git
+python3 CF-SAST/scripts/cfml_sast_simple.py --scan-all
 ```
 
 ## 🎯 Usage
 
-### Command Line Scanning
+Examples use `python3`. On Windows, substitute `py -3`.
 
-**Basic Scanning:**
+### Scanning
+
 ```bash
+# Scan every CFML file beneath the current directory
+python3 CFSAST/cfml_sast_simple.py --scan-all
+
+# Scan only files git reports as changed
+python3 CFSAST/cfml_sast_simple.py --scan-changed
+
 # Scan specific files
-py -3 CFSAST/cfml_sast_simple.py --files login.cfm user.cfc
-
-# Scan all CFML files in current directory
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm *.cfc *.cfml
-
-# Scan with wildcard patterns
-py -3 CFSAST/cfml_sast_simple.py --files src/**/*.cfm components/*.cfc
+python3 CFSAST/cfml_sast_simple.py --files login.cfm components/user.cfc
 ```
 
-**Output Formats:**
-```bash
-# JSON output (for CI/CD integration)
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm --json-out
+> **On `--files` with wildcards:** the scanner does not expand globs itself, it
+> relies on the shell. `--files *.cfm` works in bash and zsh but **not** in
+> `cmd.exe`, and PowerShell does not expand globs for external commands either.
+> On Windows, prefer `--scan-all` or `--scan-changed`.
 
-# SARIF 2.1.0 output (enterprise security tools)
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm --sarif
-
-# SARIF with GitHub Advanced Security
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm --sarif > results.sarif
-```
-
-**Advanced Options:**
-```bash
-# Fail CI/CD pipeline on high-severity issues
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm --fail-on-high
-
-# Create baseline to suppress existing findings
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm --baseline .sast-baseline.json --update-baseline
-
-# Scan with baseline (only show NEW findings)
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm --baseline .sast-baseline.json
-
-# Initialize .sastignore file for noise management
-py -3 CFSAST/cfml_sast_simple.py --init-ignore
-```
-
-### VS Code Extension Usage
-
-**File-Level Scanning:**
-- **Right-click scanning**: Right-click any `.cfm`, `.cfc`, or `.cfml` file → **"CFML SAST: Scan Current File"**
-- **Active file scanning**: Open a CFML file and use Command Palette
-
-**Workspace-Level Scanning:**
-- **Changed files**: Command Palette (`Ctrl+Shift+P`) → **"CFML SAST: Scan Changed Files"**
-- **Git integration**: Automatically detects changed files since last commit
-
-**Management Commands:**
-- **Baseline creation**: **"CFML SAST: Create Baseline"** to suppress existing findings
-- **Ignore file**: **"CFML SAST: Create .sastignore File"** for noise management
-- **Installation**: **"CFML SAST: Install Git Hooks"** for automated scanning
-
-**Visual Results:**
-- Professional webview panel with color-coded severity levels
-- Clickable file locations with line numbers
-- Summary statistics (High/Medium/Low counts)
-- Responsive design matching VS Code theme
-
-### Git Integration (Automated Security)
-
-The scanner automatically runs on `git push` and scans only changed files:
+### Output formats
 
 ```bash
-git add .
-git commit -m "Updated user authentication"
-git push  # ← SAST scanner runs here automatically
+# JSON, for scripting
+python3 CFSAST/cfml_sast_simple.py --scan-all --json-out
+
+# SARIF 2.1.0, for GitHub code scanning and other security tooling
+python3 CFSAST/cfml_sast_simple.py --scan-all --sarif > results.sarif
 ```
 
-**Cross-Platform Git Hooks:**
-- **Windows**: `prepush.bat` with proper error handling
-- **Unix/Linux/Mac**: `prepush.sh` with strict bash settings
-- **Security**: Path validation and input sanitization
-- **Performance**: Only scans changed CFML files
+Only the report goes to stdout; progress and warnings go to stderr, so
+`--json-out` and `--sarif` can be piped directly into another tool.
 
-## 🎛️ Configuration & Noise Management
+Paths in every format are relative to the directory you scan from. That is what
+makes a baseline file portable between a developer machine and CI, and what
+lets GitHub anchor SARIF annotations to the right lines.
 
-### .sastignore File
+### Exit codes
 
-Create a `.sastignore` file to exclude files, directories, or specific rules:
+| Code | Meaning |
+|------|---------|
+| `0` | Scan completed; no HIGH findings (or `--fail-on-high` not passed) |
+| `1` | Scan completed and `--fail-on-high` found at least one HIGH finding |
+| `2` | Scan did **not** complete — it hit the time budget or the findings cap, so results are partial |
+| `130` | Interrupted (Ctrl-C) |
+
+Exit code `2` exists so a truncated scan cannot be mistaken for a clean one.
+Treat it as a failure in CI.
+
+### Noise management
 
 ```bash
-# Initialize with default patterns
-py -3 CFSAST/cfml_sast_simple.py --init-ignore
+# Create a starter .sastignore
+python3 CFSAST/cfml_sast_simple.py --init-ignore
+
+# Record current findings as the baseline (one-time)
+python3 CFSAST/cfml_sast_simple.py --scan-all --baseline .sast-baseline.json --update-baseline
+
+# Later scans report only findings not in the baseline
+python3 CFSAST/cfml_sast_simple.py --scan-all --baseline .sast-baseline.json
 ```
 
-**Example .sastignore:**
-```
-# Ignore test files
-*test*
-*Test*
-*/tests/*
-*/spec/*
+**`.sastignore` matching:** each line is a glob (`*` and `?`) matched as an
+**unanchored substring** against the whole relative path. `*test*` therefore
+excludes anything with "test" anywhere in its path, including
+`src/latest/order.cfm`. Prefer specific patterns such as `tests/*` or
+`vendor/*`.
 
-# Ignore third-party libraries
-*/lib/*
-*/vendor/*
-*/node_modules/*
-*/external/*
+### Other options
 
-# Ignore generated files
-*generated*
-*auto*
-*.min.cfm
-*.min.cfc
+| Flag | Purpose |
+|------|---------|
+| `--fail-on-high` | Exit 1 when a HIGH finding survives ignores and baseline |
+| `--timeout SECONDS` | Wall-clock budget (default 300). Exceeding it exits 2 |
+| `--baseline FILE` | Suppress findings recorded in FILE |
+| `--update-baseline` | Rewrite FILE with the current findings (backs up the old one) |
+| `--init-ignore` | Write a starter `.sastignore` |
 
-# Ignore specific rules in certain files
-CF-XSS-001:*/admin/*
-CF-SQLI-001:*/legacy/*
+## 🏢 CI/CD integration
 
-# Ignore development/debug files
-*debug*
-*temp*
-*tmp*
-*.bak
+### GitHub Actions
 
-# Ignore documentation
-*/docs/*
-*.md
-*.txt
-```
-
-### Baseline Suppression
-
-Suppress existing findings to focus only on new security issues:
-
-```bash
-# Create baseline from current state (one-time setup)
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm *.cfc --baseline .sast-baseline.json --update-baseline
-
-# Future scans only show NEW findings
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm *.cfc --baseline .sast-baseline.json
-
-# Update baseline when fixing issues
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm *.cfc --baseline .sast-baseline.json --update-baseline
-```
-
-### VS Code Configuration
-
-**Settings (File → Preferences → Settings → Extensions → CFML SAST):**
-
-```json
-{
-    "cfmlSast.outputFormat": "json",        // "json" or "sarif"
-    "cfmlSast.useBaseline": true,           // Use .sast-baseline.json
-    "cfmlSast.showIgnoredFiles": true       // Show ignored file counts
-}
-```
-
-## 🏢 Enterprise Features
-
-### SARIF 2.1.0 Output
-
-Generate industry-standard SARIF reports for enterprise security tools:
-
-```bash
-# GitHub Advanced Security
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm --sarif > results.sarif
-
-# Azure DevOps Security
-py -3 CFSAST/cfml_sast_simple.py --files src/**/*.cfm --sarif --baseline .sast-baseline.json
-
-# SonarQube Integration
-py -3 CFSAST/cfml_sast_simple.py --files *.cfm *.cfc --sarif --fail-on-high
-```
-
-### CI/CD Integration
-
-**GitHub Actions:**
 ```yaml
-- name: CFML Security Scan
-  run: |
-    python -m pip install --upgrade pip
-    py -3 CFSAST/cfml_sast_simple.py --files *.cfm *.cfc --sarif --fail-on-high > results.sarif
-    
+- name: CFML security scan
+  run: python3 CFSAST/cfml_sast_simple.py --scan-all --sarif > results.sarif
+  continue-on-error: true      # let the upload run, then gate below
+
 - name: Upload SARIF
-  uses: github/codeql-action/upload-sarif@v2
+  uses: github/codeql-action/upload-sarif@v3
+  if: always()
   with:
     sarif_file: results.sarif
+
+- name: Gate on high-severity findings
+  run: python3 CFSAST/cfml_sast_simple.py --scan-all --fail-on-high
 ```
 
-**Jenkins Pipeline:**
+The gate is a separate step because `--fail-on-high` exits non-zero, which
+would otherwise skip the upload.
+
+### Jenkins
+
 ```groovy
-stage('CFML Security Scan') {
+stage('CFML security scan') {
     steps {
-        sh 'python3 CFSAST/cfml_sast_simple.py --files *.cfm *.cfc --json-out --fail-on-high'
+        sh 'python3 CFSAST/cfml_sast_simple.py --scan-all --json-out --fail-on-high > findings.json'
     }
 }
 ```
 
-### Security Features
+## 🔧 VS Code extension
 
-- **Path Traversal Protection**: Prevents scanning outside project directory
-- **Input Validation**: Sanitizes all file paths and arguments
-- **Resource Limits**: File size limits (5MB), scan timeouts (5min), memory controls
-- **Secure Downloads**: SSL verification and integrity checking
-- **Safe Regex**: ReDoS protection in ignore patterns
-- **Output Sanitization**: Prevents injection in scan results
+**Commands** (Command Palette):
 
-## 📊 Performance & Limits
+- **CFML SAST: Scan Current File**
+- **CFML SAST: Scan Changed Files**
+- **CFML SAST: Install Git Hooks** — installs the scanner and the pre-push hook
+- **CFML SAST: Create Baseline**
+- **CFML SAST: Create .sastignore File**
 
-- **Maximum File Size**: 5MB per file
-- **Maximum Files**: 10,000 files per scan
-- **Scan Timeout**: 5 minutes
-- **Maximum Findings**: 10,000 per scan
-- **Memory Management**: Automatic cleanup and limits
-- **Concurrent Safety**: Thread-safe operations
+**Results panel:** findings are listed as cards showing the rule, severity,
+description and the file path with its line number. **Select a finding to jump
+straight to that line** — click it, or move to it with `Tab` and press `Enter`
+or `Space`. The source opens in the main editor column with the cursor on the
+reported line, while the results stay open beside it.
+
+**Settings:**
+
+```json
+{
+    "cfmlSast.outputFormat": "json",        // "json" or "sarif"
+    "cfmlSast.useBaseline": true,           // apply .sast-baseline.json when present
+    "cfmlSast.showIgnoredFiles": true       // log skipped-file counts
+}
+```
+
+The extension does not evaluate `.sastignore` itself; it passes files to the
+scanner, which applies the patterns. This keeps one implementation of the
+matching rules.
+
+## 🪝 Git hook
+
+`install.py` writes `.git/hooks/pre-push`, which runs the scanner over the CFML
+files changed since the upstream branch and blocks the push on a HIGH finding.
+
+The hook is a POSIX shell script on every platform, because git only executes
+`.git/hooks/pre-push` — a `pre-push.bat` is never invoked. On Windows this runs
+under the bash that ships with Git for Windows. `scripts/sast/prepush.bat` is
+provided for running a scan by hand from `cmd.exe`.
+
+`prepush.sh` is written for bash 3.2, the version macOS still ships as
+`/bin/bash`.
+
+To bypass the hook for a single push:
+
+```bash
+git push --no-verify
+```
+
+## 📊 Limits
+
+| Limit | Value | Behaviour when hit |
+|-------|-------|--------------------|
+| File size | 5 MB | File skipped, warning on stderr |
+| Files per invocation | 10,000 | Run aborts with an error |
+| Findings | 10,000 | Scan stops, exit code 2 |
+| Wall clock | 300s (`--timeout`) | Scan stops, exit code 2 |
+
+## 🛡️ Security properties
+
+Accurately, and no more than this:
+
+- **Scan confinement** — files resolving outside the working directory are
+  refused, so a path in a file list cannot pull in `/etc/passwd`.
+- **Resource limits** — the caps above bound memory and runtime, and a scan cut
+  short reports exit code 2 rather than presenting partial results as complete.
+- **Bounded patterns** — rule regexes avoid unbounded nested quantifiers, and
+  `.sastignore` patterns are length-capped. Note that the time budget is checked
+  between matches; it cannot interrupt a single regex already executing.
+- **Output escaping** — the VS Code results panel HTML-escapes all finding text
+  and runs with scripts disabled under a restrictive CSP.
+- **Transport** — `install.py` downloads over HTTPS with certificate
+  verification. There is **no** published hash pinning; if you need supply-chain
+  guarantees, clone the repository at a reviewed commit instead of using the
+  installer.
+
+The scanner is single-threaded. It makes no thread-safety guarantees because it
+needs none.
 
 ## 🔧 Requirements
 
-- **Python**: 3.6+ (3.8+ recommended)
-- **Git**: For changed file detection and hooks
-- **VS Code**: 1.74.0+ (for extension)
-- **File Types**: `.cfm`, `.cfc`, `.cfml`, `.cfinclude`
-- **Operating Systems**: Windows, macOS, Linux
+- **Python** 3.8 or newer
+- **Git** — for `--scan-changed` and the pre-push hook
+- **VS Code** 1.74.0+ for the extension
+- **File types** — `.cfm`, `.cfc`, `.cfml`, `.cfinclude`
+- **Platforms** — Windows, macOS, Linux
 
-## 🚀 Getting Started (Quick Start)
+## 🧪 Development
 
-1. **Install in your ColdFusion project:**
-   ```bash
-   cd your-coldfusion-project
-   py -3 -c "import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/madhabdhakal/CF-SAST/main/install.py', 'install.py')"
-   py -3 install.py
-   ```
+```bash
+# Python test suite (rule fixtures, CLI behaviour, git hook integration)
+python3 -m unittest discover -s tests -t tests -v
 
-2. **Run your first scan:**
-   ```bash
-   py -3 CFSAST/cfml_sast_simple.py --files *.cfm *.cfc
-   ```
+# VS Code extension unit tests
+node --test vscode-extension/test/extension.test.js
+```
 
-3. **Set up noise management:**
-   ```bash
-   py -3 CFSAST/cfml_sast_simple.py --init-ignore
-   py -3 CFSAST/cfml_sast_simple.py --files *.cfm --baseline .sast-baseline.json --update-baseline
-   ```
+### Adding a rule
 
-4. **Install VS Code extension** for enhanced experience
+1. Add the rule to `self.rules` in `scripts/cfml_sast_simple.py`. Use a
+   `pattern` regex, or a `finder` callable when the decision needs more context
+   than a regex can express — see `find_unparameterized_sql`.
+2. Add a fixture under `tests/fixtures/`, annotating each expected finding with
+   an inline `EXPECT: <RULE-ID>` comment on the line it should be reported on.
+3. Run the suite. A test is generated per fixture automatically; no
+   registration step. Any finding **without** a matching `EXPECT` marker fails
+   the test, so fixtures guard against false positives as well as regressions.
+
+```cfml
+<cfquery name="q" datasource="ds">
+    SELECT * FROM t WHERE id = #url.id#   <!--- EXPECT: CF-SQLI-001 --->
+</cfquery>
+```
+
+CI runs the suite on Ubuntu, macOS and Windows, shellchecks the git hook, and
+verifies that a real SARIF document parses and uses repo-relative URIs.
 
 ## 📝 License
 
-MIT License - See [LICENSE](LICENSE) file.
+MIT — see [LICENSE](LICENSE).
 
 ## 🤝 Contributing
 
-Contributions welcome! Please read our contributing guidelines and submit pull requests to our [GitHub repository](https://github.com/madhabdhakal/CF-SAST).
+Issues and pull requests welcome at the
+[GitHub repository](https://github.com/madhabdhakal/CF-SAST). Please include a
+fixture with any rule change.
 
 ## 📞 Support
 
 - **Issues**: [GitHub Issues](https://github.com/madhabdhakal/CF-SAST/issues)
-- **Documentation**: [GitHub Wiki](https://github.com/madhabdhakal/CF-SAST/wiki)
 - **VS Code Extension**: [Marketplace](https://marketplace.visualstudio.com/items?itemName=MadhabDhakal.cfml-sast-scanner)

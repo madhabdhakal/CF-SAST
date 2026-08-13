@@ -100,33 +100,36 @@ def install_cfml_sast():
         print(f"❌ Download failed: {e}")
         return False
     
-    # Create secure pre-push hook if Git repo exists
+    # Create pre-push hook if Git repo exists.
+    #
+    # The hook file must be named exactly `pre-push` with no extension on
+    # every platform: git does not look for `pre-push.bat`, so writing one
+    # installs a hook that never runs. Git for Windows ships bash and executes
+    # hooks through it, so a POSIX shell hook is correct there too.
     if Path('.git').exists():
-        if os.name == 'nt':  # Windows
-            hook_content = '''@echo off
-REM CFML SAST Pre-push Hook
-cd /d "%~dp0..\.."
-call "CFSAST\\prepush.bat"
-exit /b %errorlevel%
-'''
-            hook_file = '.git/hooks/pre-push.bat'
-        else:  # Unix/Linux/Mac
-            hook_content = '''#!/bin/bash
-# CFML SAST Pre-push Hook
+        hook_file = Path('.git/hooks/pre-push')
+        hook_content = '''#!/usr/bin/env bash
+# CFML SAST pre-push hook (installed by install.py).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-exec "./CFSAST/prepush.sh"
+exec ./CFSAST/prepush.sh "$@"
 '''
-            hook_file = '.git/hooks/pre-push'
-        
-        with open(hook_file, 'w') as f:
+
+        # Newline is forced to \\n: a CRLF shebang line makes the hook fail
+        # with "bad interpreter" under Git for Windows' bash.
+        with open(hook_file, 'w', newline='\n') as f:
             f.write(hook_content)
-        
-        # Set permissions (Unix/Linux/Mac)
-        if os.name != 'nt':
-            os.chmod('CFSAST/prepush.sh', 0o755)
-            os.chmod(hook_file, 0o755)
-        print("✅ Set up secure Git hooks")
+
+        # git requires the hook itself to be executable; prepush.sh is exec'd
+        # directly by it, so it needs the bit too. chmod is a no-op on Windows
+        # but harmless.
+        for path in (Path('CFSAST/prepush.sh'), hook_file):
+            try:
+                path.chmod(0o755)
+            except OSError as e:
+                print(f"⚠️  Could not set executable bit on {path}: {e}")
+
+        print("✅ Installed pre-push hook at .git/hooks/pre-push")
     else:
         print("ℹ️ No Git repository found - skipping Git hooks")
     

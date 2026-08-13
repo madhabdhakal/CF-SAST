@@ -2,6 +2,7 @@ const vscode = require('vscode');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 
 // Security constants
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
@@ -9,6 +10,351 @@ const MAX_OUTPUT_SIZE = 1024 * 1024; // 1MB
 const MAX_FILES = 1000;
 const SCAN_TIMEOUT = 120000; // 2 minutes
 const CFML_EXTENSIONS = /\.(cfm|cfc|cfml|cfinclude)$/i;
+
+// Exit codes from the scanner.
+const EXIT_INCOMPLETE = 2;
+
+const SEVERITY_BY_SARIF_LEVEL = { error: 'HIGH', warning: 'MEDIUM', note: 'LOW' };
+
+/**
+ * Whether `child` lies inside `parent`.
+ *
+ * A plain startsWith() comparison also accepts a sibling whose name merely
+ * shares the prefix, so /work would admit /work-evil.
+ */
+function isInside(parent, child) {
+    const rel = path.relative(path.resolve(parent), path.resolve(child));
+    return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+/**
+ * Resolve a finding's path to an absolute path inside the workspace.
+ *
+ * Findings carry paths relative to the scan root, so they need resolving
+ * before the editor can open them. Returns null when the result would land
+ * outside the workspace, so a crafted or corrupted scanner result cannot make
+ * the extension open an arbitrary file on disk.
+ */
+function resolveFindingPath(workspacePath, file) {
+    if (typeof file !== 'string' || file.length === 0) {
+        return null;
+    }
+    const absolute = path.isAbsolute(file)
+        ? path.resolve(file)
+        : path.resolve(workspacePath, file);
+    return isInside(workspacePath, absolute) ? absolute : null;
+}
+
+/**
+ * Normalise scanner stdout into a findings array.
+ *
+ * The scanner writes only the payload to stdout (progress goes to stderr), so
+ * this parses the whole stream rather than hunting for bracket boundaries.
+ * Both output formats are accepted: `outputFormat: "sarif"` used to produce a
+ * document this parser rejected outright, because SARIF is an object and the
+ * old code asserted an array.
+ */
+function parseFindings(stdout) {
+    const text = (stdout || '').trim();
+    if (!text) {
+        return [];
+    }
+
+    const parsed = JSON.parse(text);
+
+    if (Array.isArray(parsed)) {
+        return parsed;
+    }
+
+    if (parsed && Array.isArray(parsed.runs)) {
+        const findings = [];
+        for (const run of parsed.runs) {
+            for (const result of run.results || []) {
+                const loc = (result.locations || [])[0] || {};
+                const physical = loc.physicalLocation || {};
+                findings.push({
+                    file: (physical.artifactLocation || {}).uri || '',
+                    line: (physical.region || {}).startLine || 1,
+                    rule_id: result.ruleId || '',
+                    severity: SEVERITY_BY_SARIF_LEVEL[result.level] || 'MEDIUM',
+                    description: (result.message || {}).text || ''
+                });
+            }
+        }
+        return findings;
+    }
+
+    throw new Error('Unrecognised scanner output');
+}
+
+/** Clamp and coerce findings coming back from an external process. */
+function sanitizeFindings(findings) {
+    const out = [];
+    for (const f of findings.slice(0, 1000)) {
+        if (!f || typeof f !== 'object') continue;
+        out.push({
+            file: typeof f.file === 'string' ? f.file.substring(0, 500) : '',
+            line: typeof f.line === 'number' ? Math.max(1, Math.min(f.line, 999999)) : 1,
+            rule_id: typeof f.rule_id === 'string' ? f.rule_id.substring(0, 50) : '',
+            severity: ['HIGH', 'MEDIUM', 'LOW'].includes(f.severity) ? f.severity : 'UNKNOWN',
+            description: typeof f.description === 'string' ? f.description.substring(0, 1000) : ''
+        });
+    }
+    return out;
+}
+
+function generateResultsHtml(findings) {
+    // Fresh per render, so the CSP admits only this page's own inline
+    // script block.
+    const nonce = crypto.randomBytes(16).toString('base64');
+
+    // Escape HTML to prevent XSS
+    const escapeHtml = (text) => {
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    };
+    
+    const getSeverityIcon = (severity) => {
+        switch(severity) {
+            case 'HIGH': return '🔴';
+            case 'MEDIUM': return '🟡';
+            case 'LOW': return '🔵';
+            default: return '⚪';
+        }
+    };
+    
+    const shown = findings.slice(0, 500);
+    const cards = shown.map((f, index) => {
+        const severity = escapeHtml(f.severity || 'UNKNOWN');
+        const ruleId = escapeHtml(f.rule_id || 'N/A');
+        // The full relative path, not just the basename: with several
+        // matches of the same rule, the basename alone cannot tell them
+        // apart, and the path is what identifies the file to open.
+        const filePath = escapeHtml(f.file || 'unknown');
+        const line = parseInt(f.line) || 0;
+        const description = escapeHtml(f.description || 'No description');
+        const icon = getSeverityIcon(severity);
+
+        return `
+            <div class="finding-card ${severity.toLowerCase()}"
+                 role="button"
+                 tabindex="0"
+                 data-index="${index}"
+                 title="Open ${filePath} at line ${line}">
+                <div class="card-header">
+                    <span class="severity-badge">${icon} ${severity}</span>
+                    <span class="rule-id">${ruleId}</span>
+                </div>
+                <div class="card-body">
+                    <div class="description">${description}</div>
+                    <div class="location">
+                        <span class="file-name">${filePath}</span>
+                        <span class="line-number">Line ${line}</span>
+                    </div>
+                </div>
+            </div>`;
+    }).join('');
+
+    const truncationNote = findings.length > shown.length
+        ? `<div class="tip">Showing the first ${shown.length} of ${findings.length} findings.
+               Use the CLI for the full list.</div>`
+        : '';
+
+    const high = findings.filter(f => f.severity === 'HIGH').length;
+    const medium = findings.filter(f => f.severity === 'MEDIUM').length;
+    const low = findings.filter(f => f.severity === 'LOW').length;
+    
+    return `<!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+        <title>CFML SAST Results</title>
+        <style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                margin: 0;
+                padding: 20px;
+                background: var(--vscode-editor-background);
+                color: var(--vscode-editor-foreground);
+                line-height: 1.5;
+            }
+            
+            .header {
+                margin-bottom: 24px;
+                padding-bottom: 16px;
+                border-bottom: 1px solid var(--vscode-panel-border);
+            }
+            
+            .title {
+                font-size: 24px;
+                font-weight: 600;
+                margin: 0 0 8px 0;
+                color: var(--vscode-editor-foreground);
+            }
+            
+            .summary {
+                display: flex;
+                gap: 16px;
+                margin: 16px 0;
+            }
+            
+            .stat {
+                padding: 8px 12px;
+                border-radius: 6px;
+                font-weight: 500;
+                font-size: 14px;
+            }
+            
+            .stat.high { background: rgba(244, 67, 54, 0.1); color: #f44336; }
+            .stat.medium { background: rgba(255, 152, 0, 0.1); color: #ff9800; }
+            .stat.low { background: rgba(33, 150, 243, 0.1); color: #2196f3; }
+            
+            .findings {
+                display: flex;
+                flex-direction: column;
+                gap: 12px;
+            }
+            
+            .finding-card {
+                background: var(--vscode-editor-widget-background);
+                border: 1px solid var(--vscode-panel-border);
+                border-radius: 8px;
+                padding: 16px;
+                transition: all 0.2s ease;
+                cursor: pointer;
+            }
+
+            .finding-card:hover {
+                border-color: var(--vscode-focusBorder);
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                background: var(--vscode-list-hoverBackground);
+            }
+
+            /* Keyboard users get the same affordance as mouse users. */
+            .finding-card:focus-visible {
+                outline: 1px solid var(--vscode-focusBorder);
+                outline-offset: 2px;
+            }
+
+            .finding-card:active {
+                background: var(--vscode-list-activeSelectionBackground);
+            }
+            
+            .card-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 12px;
+            }
+            
+            .severity-badge {
+                font-weight: 600;
+                font-size: 14px;
+            }
+            
+            .rule-id {
+                font-family: 'Courier New', monospace;
+                font-size: 12px;
+                background: var(--vscode-badge-background);
+                color: var(--vscode-badge-foreground);
+                padding: 4px 8px;
+                border-radius: 4px;
+            }
+            
+            .description {
+                font-size: 14px;
+                margin-bottom: 8px;
+                color: var(--vscode-editor-foreground);
+            }
+            
+            .location {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                font-size: 12px;
+                color: var(--vscode-descriptionForeground);
+            }
+            
+            .file-name {
+                font-family: 'Courier New', monospace;
+                font-weight: 500;
+                color: var(--vscode-textLink-foreground);
+                text-decoration: underline;
+                word-break: break-all;
+            }
+            
+            .line-number {
+                background: var(--vscode-textBlockQuote-background);
+                padding: 2px 6px;
+                border-radius: 3px;
+            }
+            
+            .tip {
+                margin-top: 24px;
+                padding: 12px;
+                background: var(--vscode-textBlockQuote-background);
+                border-left: 4px solid var(--vscode-textLink-foreground);
+                border-radius: 0 4px 4px 0;
+                font-size: 13px;
+                color: var(--vscode-descriptionForeground);
+            }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1 class="title">🔍 CFML Security Scan Results</h1>
+            <div class="summary">
+                <div class="stat high">🔴 ${high} High</div>
+                <div class="stat medium">🟡 ${medium} Medium</div>
+                <div class="stat low">🔵 ${low} Low</div>
+            </div>
+        </div>
+        
+        <div class="findings">
+            ${cards}
+        </div>
+
+        ${truncationNote}
+
+        <div class="tip">
+            💡 <strong>Tip:</strong> Select a finding to jump to that line. Use a
+            <code>.sastignore</code> file to exclude paths, or a baseline to suppress
+            existing findings.
+        </div>
+
+        <script nonce="${nonce}">
+            (function () {
+                const vscodeApi = acquireVsCodeApi();
+
+                // Only the card's index travels back to the extension; the
+                // file path is resolved there, not supplied from here.
+                function open(card) {
+                    vscodeApi.postMessage({
+                        command: 'open',
+                        index: Number(card.getAttribute('data-index'))
+                    });
+                }
+
+                for (const card of document.querySelectorAll('.finding-card')) {
+                    card.addEventListener('click', () => open(card));
+                    card.addEventListener('keydown', (event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault();
+                            open(card);
+                        }
+                    });
+                }
+            })();
+        </script>
+    </body>
+    </html>`;
+}
 
 function activate(context) {
     const scanFile = vscode.commands.registerCommand('cfmlSast.scanFile', (uri) => {
@@ -43,7 +389,7 @@ function activate(context) {
         // Security: Validate path
         try {
             const resolvedPath = path.resolve(ignorePath);
-            if (!resolvedPath.startsWith(path.resolve(workspaceFolder.uri.fsPath))) {
+            if (!isInside(workspaceFolder.uri.fsPath, resolvedPath)) {
                 vscode.window.showErrorMessage('Invalid file path');
                 return;
             }
@@ -56,54 +402,35 @@ function activate(context) {
             vscode.window.showWarningMessage('.sastignore already exists');
             return;
         }
-        
-        const ignoreContent = `# CFML SAST Ignore Patterns
-# Lines starting with # are comments
 
-# Ignore test files
-*test*
-*Test*
-*/tests/*
-*/spec/*
+        // Delegate to the scanner's --init-ignore rather than keeping a second
+        // copy of the template here; the two would drift apart otherwise.
+        const workspacePath = workspaceFolder.uri.fsPath;
+        const scannerPath = path.join(workspacePath, 'CFSAST', 'cfml_sast_simple.py');
+        if (!fs.existsSync(scannerPath)) {
+            vscode.window.showErrorMessage('CFML SAST scanner not found. Run "CFML SAST: Install Git Hooks" first.');
+            return;
+        }
 
-# Ignore third-party libraries
-*/lib/*
-*/vendor/*
-*/node_modules/*
-*/external/*
+        const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
+        const proc = spawn(pythonCmd, [scannerPath, '--init-ignore'], {
+            cwd: workspacePath,
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
 
-# Ignore generated files
-*generated*
-*auto*
-*.min.cfm
-*.min.cfc
+        let procStderr = '';
+        proc.stderr.on('data', (data) => { procStderr += data.toString(); });
 
-# Ignore specific rules in certain files
-# CF-XSS-001:*/admin/*
-# CF-SQLI-001:*/legacy/*
-
-# Ignore development/debug files
-*debug*
-*temp*
-*tmp*
-*.bak
-
-# Ignore documentation
-*/docs/*
-*.md
-*.txt
-`;
-        
-        try {
-            fs.writeFileSync(ignorePath, ignoreContent, 'utf8');
+        proc.on('close', (code) => {
+            if (code !== 0) {
+                vscode.window.showErrorMessage(`Failed to create .sastignore: ${procStderr.trim()}`);
+                return;
+            }
             vscode.window.showInformationMessage('✅ Created .sastignore file with default patterns');
-            
             vscode.workspace.openTextDocument(ignorePath).then(doc => {
                 vscode.window.showTextDocument(doc);
             });
-        } catch (error) {
-            vscode.window.showErrorMessage(`Failed to create .sastignore: ${error.message}`);
-        }
+        });
     });
     
     const createBaseline = vscode.commands.registerCommand('cfmlSast.createBaseline', () => {
@@ -121,7 +448,7 @@ function activate(context) {
         // Security: Validate scanner path
         try {
             const resolvedPath = path.resolve(scannerPath);
-            if (!resolvedPath.startsWith(path.resolve(workspaceFolder.uri.fsPath)) || !fs.existsSync(resolvedPath)) {
+            if (!isInside(workspaceFolder.uri.fsPath, resolvedPath) || !fs.existsSync(resolvedPath)) {
                 vscode.window.showErrorMessage('CFML SAST scanner not found. Install first.');
                 return;
             }
@@ -214,7 +541,7 @@ function activate(context) {
             const resolvedTargetDir = path.resolve(targetDir);
             const resolvedWorkspace = path.resolve(workspacePath);
             
-            if (!resolvedTargetDir.startsWith(resolvedWorkspace)) {
+            if (!isInside(resolvedWorkspace, resolvedTargetDir)) {
                 vscode.window.showErrorMessage('Invalid installation path');
                 return;
             }
@@ -225,12 +552,29 @@ function activate(context) {
             }
             
             // Try different Python commands
-            const pythonCommands = process.platform === 'win32' 
+            const pythonCommands = process.platform === 'win32'
                 ? ['py', 'python', 'python3']
                 : ['python3', 'python'];
-            
-            const script = `import urllib.request; urllib.request.urlretrieve('https://raw.githubusercontent.com/madhabdhakal/CF-SAST/main/scripts/cfml_sast_simple.py', 'CFSAST/cfml_sast_simple.py'); urllib.request.urlretrieve('https://raw.githubusercontent.com/madhabdhakal/CF-SAST/main/scan_project.ps1', 'CFSAST/scan_project.ps1'); print('Downloaded successfully')`;
-            
+
+            // Fetch install.py and run it, rather than reimplementing the
+            // install here. This command is titled "Install Git Hooks", and
+            // the previous inline script downloaded only the scanner — it
+            // never wrote a hook, so the command did not do what it said.
+            // install.py sets up the scanner, the prepush scripts and
+            // .git/hooks/pre-push together.
+            const script = [
+                'import ssl, urllib.request, runpy',
+                "url = 'https://raw.githubusercontent.com/madhabdhakal/CF-SAST/main/install.py'",
+                "req = urllib.request.Request(url, headers={'User-Agent': 'CFML-SAST-Extension'})",
+                'ctx = ssl.create_default_context()',
+                'with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:',
+                '    data = resp.read()',
+                'if len(data) > 1024 * 1024:',
+                "    raise SystemExit('installer unexpectedly large')",
+                "open('install.py', 'wb').write(data)",
+                "runpy.run_path('install.py', run_name='__main__')"
+            ].join('\n');
+
             let commandIndex = 0;
             
             function tryNextPython() {
@@ -277,10 +621,11 @@ function activate(context) {
                         }
                     }
                     
-                    const psFile = path.join(targetDir, 'scan_project.ps1');
                     if (fs.existsSync(targetFile)) {
-                        const hasPs1 = fs.existsSync(psFile);
-                        vscode.window.showInformationMessage(`✅ CFML SAST Scanner installed successfully using ${pythonCmd}!${hasPs1 ? ' (includes PowerShell script)' : ''}`);
+                        const hookInstalled = fs.existsSync(path.join(workspacePath, '.git', 'hooks', 'pre-push'));
+                        vscode.window.showInformationMessage(
+                            `✅ CFML SAST installed using ${pythonCmd}` +
+                            (hookInstalled ? ' (pre-push hook active)' : ' (no git repo - hook skipped)'));
                     } else {
                         vscode.window.showErrorMessage('Installation failed - scanner file not created');
                     }
@@ -300,7 +645,7 @@ function activate(context) {
         // Security: Validate scanner path
         try {
             const resolvedScannerPath = path.resolve(scannerPath);
-            if (!resolvedScannerPath.startsWith(path.resolve(workspacePath)) || !fs.existsSync(resolvedScannerPath)) {
+            if (!isInside(workspacePath, resolvedScannerPath) || !fs.existsSync(resolvedScannerPath)) {
                 vscode.window.showErrorMessage('CFML SAST scanner not found. Run "CFML SAST: Install Git Hooks" first.');
                 return;
             }
@@ -330,15 +675,23 @@ function activate(context) {
         const pythonProcess = spawn(pythonCmd, args, {
             cwd: workspacePath,
             stdio: ['ignore', 'pipe', 'pipe'],
+            // Without this the command hangs forever if the scanner wedges.
+            timeout: SCAN_TIMEOUT,
             env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
         });
-        
+
         let stdout = '';
         let stderr = '';
-        
+        let truncated = false;
+
         pythonProcess.stdout.on('data', (data) => {
             stdout += data.toString();
-            if (stdout.length > MAX_OUTPUT_SIZE) pythonProcess.kill();
+            if (stdout.length > MAX_OUTPUT_SIZE) {
+                // Killing mid-stream leaves stdout as invalid JSON, so record
+                // why rather than reporting it as a parse failure.
+                truncated = true;
+                pythonProcess.kill();
+            }
         });
         
         pythonProcess.stderr.on('data', (data) => {
@@ -346,70 +699,38 @@ function activate(context) {
         });
         
         pythonProcess.on('close', (code) => {
-            if (code !== 0 && !stdout) {
+            if (code === EXIT_INCOMPLETE) {
+                vscode.window.showWarningMessage(
+                    '⚠️ Scan did not finish (timeout or findings limit). Results are incomplete.');
+            }
+
+            if (!stdout.trim()) {
                 if (stderr.includes('No changed CFML files found')) {
                     vscode.window.showInformationMessage('✅ No changed CFML files to scan');
-                } else {
+                } else if (code !== 0 && code !== EXIT_INCOMPLETE) {
                     vscode.window.showErrorMessage(`Scan failed: ${stderr}`);
+                } else {
+                    vscode.window.showInformationMessage('✅ No security issues found in changed files');
                 }
                 return;
             }
-            
+
+            if (truncated) {
+                vscode.window.showWarningMessage(
+                    `⚠️ Results exceeded ${Math.round(MAX_OUTPUT_SIZE / 1024)}KB and were truncated. ` +
+                    'Use the CLI for a full scan: python3 CFSAST/cfml_sast_simple.py --scan-all --json-out');
+                return;
+            }
+
             try {
-                if (!stdout || stdout.trim().length === 0) {
+                const findings = sanitizeFindings(parseFindings(stdout));
+                if (findings.length === 0) {
                     vscode.window.showInformationMessage('✅ No security issues found in changed files');
                     return;
                 }
-                
-                // Extract JSON from output (filter out status messages)
-                const lines = stdout.split('\n');
-                let jsonStart = -1;
-                let jsonEnd = -1;
-                
-                // Find JSON array boundaries
-                for (let i = 0; i < lines.length; i++) {
-                    const line = lines[i].trim();
-                    if (line.startsWith('[') && jsonStart === -1) {
-                        jsonStart = i;
-                    }
-                    if (line.endsWith(']') && jsonStart !== -1) {
-                        jsonEnd = i;
-                        break;
-                    }
-                }
-                
-                if (jsonStart === -1 || jsonEnd === -1) {
-                    // No JSON found, check for completion message
-                    if (stdout.includes('Scan complete') || stdout.includes('No changed CFML files')) {
-                        vscode.window.showInformationMessage('✅ No security issues found in changed files');
-                    } else {
-                        throw new Error('No valid JSON output found');
-                    }
-                    return;
-                }
-                
-                // Extract and parse JSON
-                const jsonLines = lines.slice(jsonStart, jsonEnd + 1);
-                const jsonStr = jsonLines.join('\n');
-                
-                if (jsonStr.trim() === '[]') {
-                    vscode.window.showInformationMessage('✅ No security issues found in changed files');
-                    return;
-                }
-                
-                const results = JSON.parse(jsonStr);
-                if (!Array.isArray(results)) {
-                    throw new Error('Invalid results format');
-                }
-                
-                showResults(results, true);
-                
+                showResults(findings, true, workspacePath);
             } catch (parseError) {
-                if (stdout && (stdout.includes('Scan complete') || stdout.includes('No changed CFML files'))) {
-                    vscode.window.showInformationMessage('✅ No security issues found in changed files');
-                } else {
-                    vscode.window.showErrorMessage(`Failed to parse scan results: ${parseError.message}`);
-                }
+                vscode.window.showErrorMessage(`Failed to parse scan results: ${parseError.message}`);
             }
         });
     }
@@ -448,17 +769,21 @@ function activate(context) {
                 }
                 
                 // Security: Prevent path traversal
-                if (!resolvedPath.startsWith(workspacePath)) {
+                if (!isInside(workspacePath, resolvedPath)) {
                     console.warn(`Blocked path traversal attempt: ${file}`);
                     continue;
                 }
                 
-                // Check file exists and is CFML
-                if (fs.existsSync(resolvedPath) && 
-                    fs.statSync(resolvedPath).isFile() && 
-                    CFML_EXTENSIONS.test(resolvedPath) &&
-                    !shouldIgnoreFile(resolvedPath, workspacePath)) {
-                    
+                // Check file exists and is CFML. .sastignore is deliberately
+                // NOT evaluated here: the scanner applies it, and a second
+                // implementation in JS drifted from the Python one (anchored
+                // vs unanchored matching gave different results for the same
+                // pattern).
+                if (fs.existsSync(resolvedPath) &&
+                    fs.statSync(resolvedPath).isFile() &&
+                    CFML_EXTENSIONS.test(resolvedPath)) {
+
+
                     // Check file size
                     const stats = fs.statSync(resolvedPath);
                     if (stats.size > MAX_FILE_SIZE) {
@@ -474,30 +799,31 @@ function activate(context) {
         }
         
         const totalFiles = files.filter(f => typeof f === 'string' && CFML_EXTENSIONS.test(f)).length;
-        const ignoredCount = totalFiles - absoluteFiles.length;
-        
+        const skippedCount = totalFiles - absoluteFiles.length;
+
         if (absoluteFiles.length === 0) {
-            if (ignoredCount > 0) {
-                vscode.window.showInformationMessage(`No CFML files to scan (${ignoredCount} files ignored)`);
+            if (skippedCount > 0) {
+                vscode.window.showInformationMessage(
+                    `No CFML files to scan (${skippedCount} skipped: missing, too large, or outside the workspace)`);
             } else {
                 vscode.window.showInformationMessage('No valid CFML files found to scan');
             }
             return;
         }
-        
-        // Show ignore feedback if enabled
+
         const config = vscode.workspace.getConfiguration('cfmlSast');
-        if (ignoredCount > 0 && config.get('showIgnoredFiles', true)) {
-            console.log(`CFML SAST: Ignored ${ignoredCount} files`);
+        if (skippedCount > 0 && config.get('showIgnoredFiles', true)) {
+            console.log(`CFML SAST: skipped ${skippedCount} files before scanning`);
         }
-        
+
+
         const pythonCmd = process.platform === 'win32' ? 'python' : 'python3';
         const scannerPath = path.join(workspacePath, 'CFSAST', 'cfml_sast_simple.py');
         
         // Security: Validate scanner path
         try {
             const resolvedScannerPath = path.resolve(scannerPath);
-            if (!resolvedScannerPath.startsWith(workspacePath) || !fs.existsSync(resolvedScannerPath)) {
+            if (!isInside(workspacePath, resolvedScannerPath) || !fs.existsSync(resolvedScannerPath)) {
                 vscode.window.showErrorMessage('CFML SAST scanner not found. Run "CFML SAST: Install Git Hooks" first.');
                 return;
             }
@@ -525,15 +851,23 @@ function activate(context) {
         const pythonProcess = spawn(pythonCmd, args, {
             cwd: workspacePath,
             stdio: ['ignore', 'pipe', 'pipe'],
+            // Without this the command hangs forever if the scanner wedges.
+            timeout: SCAN_TIMEOUT,
             env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
         });
-        
+
         let stdout = '';
         let stderr = '';
-        
+        let truncated = false;
+
         pythonProcess.stdout.on('data', (data) => {
             stdout += data.toString();
-            if (stdout.length > MAX_OUTPUT_SIZE) pythonProcess.kill();
+            if (stdout.length > MAX_OUTPUT_SIZE) {
+                // Killing mid-stream leaves stdout as invalid JSON, so record
+                // why rather than reporting it as a parse failure.
+                truncated = true;
+                pythonProcess.kill();
+            }
         });
         
         pythonProcess.stderr.on('data', (data) => {
@@ -541,405 +875,135 @@ function activate(context) {
         });
         
         pythonProcess.on('close', (code) => {
-            if (code !== 0 && !stdout) {
-                vscode.window.showErrorMessage(`Scan failed: ${stderr}`);
+            if (code === EXIT_INCOMPLETE) {
+                vscode.window.showWarningMessage(
+                    '⚠️ Scan did not finish (timeout or findings limit). Results are incomplete.');
+            }
+
+            if (!stdout.trim()) {
+                if (code !== 0 && code !== EXIT_INCOMPLETE) {
+                    vscode.window.showErrorMessage(`Scan failed: ${stderr}`);
+                } else {
+                    vscode.window.showInformationMessage('✅ Scan completed with no security issues found');
+                }
                 return;
             }
-            
+
+            if (truncated) {
+                vscode.window.showWarningMessage(
+                    `⚠️ Results exceeded ${Math.round(MAX_OUTPUT_SIZE / 1024)}KB and were truncated. ` +
+                    'Use the CLI for a full scan: python3 CFSAST/cfml_sast_simple.py --scan-all --json-out');
+                return;
+            }
+
             try {
-                if (!stdout || stdout.trim().length === 0 || stdout.trim() === '[]') {
+                const findings = sanitizeFindings(parseFindings(stdout));
+                if (findings.length === 0) {
                     vscode.window.showInformationMessage('✅ Scan completed with no security issues found');
                     return;
                 }
-                
-                // Security: Validate output size
-                const output = stdout.trim();
-                if (output.length > MAX_OUTPUT_SIZE) {
-                    vscode.window.showWarningMessage(
-                        `⚠️ Large scan results (${Math.round(output.length/1024)}KB). Use CLI for full results.`,
-                        'Show Summary'
-                    ).then(selection => {
-                        if (selection === 'Show Summary') {
-                            try {
-                                const truncated = output.substring(0, 50000);
-                                const partial = JSON.parse(truncated + ']');
-                                showResults(partial.slice(0, 50), isWorkspace);
-                            } catch {
-                                vscode.window.showInformationMessage('Use CLI: py -3 CFSAST/cfml_sast_simple.py --files *.cfm --json-out');
-                            }
-                        }
-                    });
-                    return;
-                }
-                
-                // Extract JSON from mixed output
-                const lines = output.split('\n');
-                let jsonStart = -1;
-                let jsonEnd = -1;
-                
-                // Find JSON array boundaries
-                for (let i = 0; i < lines.length; i++) {
-                    const line = lines[i].trim();
-                    if (line.startsWith('[') && jsonStart === -1) {
-                        jsonStart = i;
-                    }
-                    if (line.endsWith(']') && jsonStart !== -1) {
-                        jsonEnd = i;
-                        break;
-                    }
-                }
-                
-                if (jsonStart === -1 || jsonEnd === -1) {
-                    // No JSON found, assume no findings
-                    vscode.window.showInformationMessage('✅ Scan completed with no security issues found');
-                    return;
-                }
-                
-                // Extract and parse JSON
-                const jsonLines = lines.slice(jsonStart, jsonEnd + 1);
-                const jsonStr = jsonLines.join('\n');
-                
-                let results;
-                try {
-                    results = JSON.parse(jsonStr);
-                } catch (parseError) {
-                    throw new Error(`Invalid JSON output: ${parseError.message}`);
-                }
-                
-                // Validate results structure
-                if (!Array.isArray(results)) {
-                    throw new Error('Results must be an array');
-                }
-                
-                if (results.length > 10000) {
-                    throw new Error('Too many results - use CLI for large scans');
-                }
-                
-                // Validate and sanitize each result object
-                const sanitizedResults = [];
-                for (let i = 0; i < Math.min(results.length, 1000); i++) {
-                    const result = results[i];
-                    if (!result || typeof result !== 'object') {
-                        continue;
-                    }
-                    
-                    // Create sanitized copy
-                    const sanitized = {
-                        file: typeof result.file === 'string' ? result.file.substring(0, 500) : '',
-                        line: typeof result.line === 'number' ? Math.max(1, Math.min(result.line, 999999)) : 1,
-                        rule_id: typeof result.rule_id === 'string' ? result.rule_id.substring(0, 50) : '',
-                        severity: ['HIGH', 'MEDIUM', 'LOW'].includes(result.severity) ? result.severity : 'UNKNOWN',
-                        description: typeof result.description === 'string' ? result.description.substring(0, 1000) : ''
-                    };
-                    
-                    sanitizedResults.push(sanitized);
-                }
-                
-                showResults(sanitizedResults, isWorkspace);
-                
+                showResults(findings, isWorkspace, workspacePath);
             } catch (parseError) {
                 console.error('Parse error:', parseError);
-                if (stdout && (stdout.includes('Scan complete') || stdout.includes('No valid CFML files'))) {
-                    vscode.window.showInformationMessage('✅ Scan completed with no security issues found');
-                } else {
-                    vscode.window.showErrorMessage(`Failed to parse scan results: ${parseError.message}`);
-                }
+                vscode.window.showErrorMessage(`Failed to parse scan results: ${parseError.message}`);
             }
         });
     }
 
-    function showResults(findings, isWorkspace) {
+    function showResults(findings, isWorkspace, workspacePath) {
         if (findings.length === 0) {
             vscode.window.showInformationMessage('✅ No security issues found');
             return;
         }
-        
+
         const high = findings.filter(f => f.severity === 'HIGH').length;
         const medium = findings.filter(f => f.severity === 'MEDIUM').length;
         const low = findings.filter(f => f.severity === 'LOW').length;
-        
+
         const message = `🔍 CFML SAST Results: High=${high} Medium=${medium} Low=${low}`;
-        
+
         vscode.window.showWarningMessage(message, 'View Details').then(selection => {
-            if (selection === 'View Details') {
-                const panel = vscode.window.createWebviewPanel(
-                    'cfmlSastResults',
-                    'CFML SAST Results',
-                    vscode.ViewColumn.One,
-                    {
-                        enableScripts: false,
-                        enableForms: false,
-                        localResourceRoots: [],
-                        retainContextWhenHidden: false
-                    }
-                );
-                
-                panel.webview.html = generateResultsHtml(findings);
+            if (selection !== 'View Details') {
+                return;
             }
+
+            const panel = vscode.window.createWebviewPanel(
+                'cfmlSastResults',
+                'CFML SAST Results',
+                // Beside, so that opening a finding puts the source in the
+                // main column instead of replacing this panel's tab.
+                vscode.ViewColumn.Beside,
+                {
+                    // Scripts are needed to report clicks back to the
+                    // extension. They are restricted to a single inline block
+                    // by the nonce in the page's CSP; no remote or local
+                    // resources are loadable.
+                    enableScripts: true,
+                    enableForms: false,
+                    localResourceRoots: [],
+                    retainContextWhenHidden: true
+                }
+            );
+
+            panel.webview.html = generateResultsHtml(findings);
+
+            panel.webview.onDidReceiveMessage(
+                (msg) => {
+                    if (!msg || msg.command !== 'open') {
+                        return;
+                    }
+                    // The index is the only thing the webview controls; the
+                    // path itself is looked up here rather than accepted from
+                    // the message.
+                    const finding = findings[msg.index];
+                    if (!finding) {
+                        return;
+                    }
+                    openFinding(finding, workspacePath);
+                },
+                undefined,
+                context.subscriptions
+            );
         });
     }
 
-    function generateResultsHtml(findings) {
-        // Escape HTML to prevent XSS
-        const escapeHtml = (text) => {
-            return String(text)
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;')
-                .replace(/'/g, '&#39;');
-        };
-        
-        const getSeverityIcon = (severity) => {
-            switch(severity) {
-                case 'HIGH': return '🔴';
-                case 'MEDIUM': return '🟡';
-                case 'LOW': return '🔵';
-                default: return '⚪';
+    /** Open a finding's file and put the cursor on the reported line. */
+    function openFinding(finding, workspacePath) {
+        const target = resolveFindingPath(workspacePath, finding.file);
+        if (!target) {
+            vscode.window.showErrorMessage(
+                `Cannot open "${finding.file}": it resolves outside the workspace.`);
+            return;
+        }
+
+        vscode.workspace.openTextDocument(target).then(
+            (doc) => {
+                // Findings are 1-based; the editor API is 0-based. Clamp in
+                // case the file changed since the scan.
+                const lineIndex = Math.max(0, Math.min((finding.line || 1) - 1, doc.lineCount - 1));
+                const range = doc.lineAt(lineIndex).range;
+                return vscode.window.showTextDocument(doc, {
+                    viewColumn: vscode.ViewColumn.One,
+                    selection: range,
+                    preserveFocus: false
+                });
+            },
+            (err) => {
+                vscode.window.showErrorMessage(
+                    `Could not open "${finding.file}": ${err && err.message ? err.message : err}`);
             }
-        };
-        
-        const cards = findings.slice(0, 500).map(f => {
-            const severity = escapeHtml(f.severity || 'UNKNOWN');
-            const ruleId = escapeHtml(f.rule_id || 'N/A');
-            const fileName = escapeHtml(f.file ? f.file.split(/[\\\/]/).pop() : 'unknown');
-            const line = parseInt(f.line) || 0;
-            const description = escapeHtml(f.description || 'No description');
-            const icon = getSeverityIcon(severity);
-            
-            return `
-                <div class="finding-card ${severity.toLowerCase()}">
-                    <div class="card-header">
-                        <span class="severity-badge">${icon} ${severity}</span>
-                        <span class="rule-id">${ruleId}</span>
-                    </div>
-                    <div class="card-body">
-                        <div class="description">${description}</div>
-                        <div class="location">
-                            <span class="file-name">${fileName}</span>
-                            <span class="line-number">Line ${line}</span>
-                        </div>
-                    </div>
-                </div>`;
-        }).join('');
-        
-        const high = findings.filter(f => f.severity === 'HIGH').length;
-        const medium = findings.filter(f => f.severity === 'MEDIUM').length;
-        const low = findings.filter(f => f.severity === 'LOW').length;
-        
-        return `<!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
-            <title>CFML SAST Results</title>
-            <style>
-                body {
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    margin: 0;
-                    padding: 20px;
-                    background: var(--vscode-editor-background);
-                    color: var(--vscode-editor-foreground);
-                    line-height: 1.5;
-                }
-                
-                .header {
-                    margin-bottom: 24px;
-                    padding-bottom: 16px;
-                    border-bottom: 1px solid var(--vscode-panel-border);
-                }
-                
-                .title {
-                    font-size: 24px;
-                    font-weight: 600;
-                    margin: 0 0 8px 0;
-                    color: var(--vscode-editor-foreground);
-                }
-                
-                .summary {
-                    display: flex;
-                    gap: 16px;
-                    margin: 16px 0;
-                }
-                
-                .stat {
-                    padding: 8px 12px;
-                    border-radius: 6px;
-                    font-weight: 500;
-                    font-size: 14px;
-                }
-                
-                .stat.high { background: rgba(244, 67, 54, 0.1); color: #f44336; }
-                .stat.medium { background: rgba(255, 152, 0, 0.1); color: #ff9800; }
-                .stat.low { background: rgba(33, 150, 243, 0.1); color: #2196f3; }
-                
-                .findings {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 12px;
-                }
-                
-                .finding-card {
-                    background: var(--vscode-editor-widget-background);
-                    border: 1px solid var(--vscode-panel-border);
-                    border-radius: 8px;
-                    padding: 16px;
-                    transition: all 0.2s ease;
-                }
-                
-                .finding-card:hover {
-                    border-color: var(--vscode-focusBorder);
-                    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-                }
-                
-                .card-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    margin-bottom: 12px;
-                }
-                
-                .severity-badge {
-                    font-weight: 600;
-                    font-size: 14px;
-                }
-                
-                .rule-id {
-                    font-family: 'Courier New', monospace;
-                    font-size: 12px;
-                    background: var(--vscode-badge-background);
-                    color: var(--vscode-badge-foreground);
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                }
-                
-                .description {
-                    font-size: 14px;
-                    margin-bottom: 8px;
-                    color: var(--vscode-editor-foreground);
-                }
-                
-                .location {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    font-size: 12px;
-                    color: var(--vscode-descriptionForeground);
-                }
-                
-                .file-name {
-                    font-family: 'Courier New', monospace;
-                    font-weight: 500;
-                }
-                
-                .line-number {
-                    background: var(--vscode-textBlockQuote-background);
-                    padding: 2px 6px;
-                    border-radius: 3px;
-                }
-                
-                .tip {
-                    margin-top: 24px;
-                    padding: 12px;
-                    background: var(--vscode-textBlockQuote-background);
-                    border-left: 4px solid var(--vscode-textLink-foreground);
-                    border-radius: 0 4px 4px 0;
-                    font-size: 13px;
-                    color: var(--vscode-descriptionForeground);
-                }
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h1 class="title">🔍 CFML Security Scan Results</h1>
-                <div class="summary">
-                    <div class="stat high">🔴 ${high} High</div>
-                    <div class="stat medium">🟡 ${medium} Medium</div>
-                    <div class="stat low">🔵 ${low} Low</div>
-                </div>
-            </div>
-            
-            <div class="findings">
-                ${cards}
-            </div>
-            
-            <div class="tip">
-                💡 <strong>Tip:</strong> Use .sastignore file to exclude files or create baseline to suppress existing findings
-            </div>
-        </body>
-        </html>`;
+        );
     }
 
-    // Helper function to check .sastignore patterns
-    function shouldIgnoreFile(filePath, workspacePath) {
-        try {
-            const ignorePath = path.join(workspacePath, '.sastignore');
-            
-            // Security: Validate ignore file path
-            const resolvedIgnorePath = path.resolve(ignorePath);
-            if (!resolvedIgnorePath.startsWith(path.resolve(workspacePath))) {
-                return false;
-            }
-            
-            if (!fs.existsSync(resolvedIgnorePath)) {
-                return false;
-            }
-            
-            // Security: Limit file size
-            const stats = fs.statSync(resolvedIgnorePath);
-            if (stats.size > 100 * 1024) { // 100KB limit
-                console.warn('.sastignore file too large, ignoring');
-                return false;
-            }
-            
-            const ignoreContent = fs.readFileSync(resolvedIgnorePath, 'utf8');
-            const lines = ignoreContent.split('\n');
-            
-            if (lines.length > 1000) { // Limit number of patterns
-                console.warn('Too many ignore patterns, using first 1000');
-                lines.splice(1000);
-            }
-            
-            const patterns = lines
-                .map(line => line.trim())
-                .filter(line => line && !line.startsWith('#') && line.length < 200);
-            
-            const relativePath = path.relative(workspacePath, filePath).replace(/\\/g, '/');
-            const fileName = path.basename(filePath);
-            
-            for (const pattern of patterns) {
-                try {
-                    // Security: Escape special regex chars except * and ?
-                    const escapedPattern = pattern
-                        .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-                        .replace(/\*/g, '.*')
-                        .replace(/\?/g, '.');
-                    
-                    // Limit regex complexity
-                    if (escapedPattern.length > 500) continue;
-                    
-                    const regex = new RegExp(`^${escapedPattern}$`, 'i');
-                    
-                    if (regex.test(relativePath) || regex.test(fileName)) {
-                        return true;
-                    }
-                } catch (regexError) {
-                    // Skip invalid patterns
-                    console.warn(`Invalid ignore pattern: ${pattern}`);
-                    continue;
-                }
-            }
-        } catch (error) {
-            console.warn(`Error reading .sastignore: ${error.message}`);
-        }
-        
-        return false;
-    }
-    
+
     context.subscriptions.push(scanFile, scanWorkspace, createIgnoreFile, createBaseline, install);
 }
 
 function deactivate() {}
 
-module.exports = { activate, deactivate };
+// The pure helpers are exported for the unit tests in test/. VS Code only
+// ever calls activate/deactivate.
+module.exports = {
+    activate, deactivate,
+    isInside, parseFindings, sanitizeFindings, resolveFindingPath, generateResultsHtml
+};

@@ -1,8 +1,8 @@
 {
   "name": "cfml-sast-scanner",
   "displayName": "CFML SAST Scanner",
-  "description": "🔒 Professional SAST scanner for ColdFusion (CFML) with enterprise security features. Detects 13+ vulnerability types including SQL injection, XSS, command execution, and unsafe uploads. Features CFScript support, SARIF output, baseline suppression, and .sastignore patterns.",
-  "version": "1.3.1",
+  "description": "🔒 SAST scanner for ColdFusion (CFML). 14 rules covering SQL injection, XSS, command execution, unsafe uploads, LDAP injection, XXE and path traversal, across both tag-based and CFScript syntax. Supports SARIF output, baseline suppression and .sastignore patterns.",
+  "version": "1.4.0",
   "publisher": "MadhabDhakal",
   "icon": "images/icon.png",
   "engines": {

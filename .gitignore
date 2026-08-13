@@ -1,13 +1,21 @@
-# Test files with vulnerabilities
-test/
+# Scratch scan output
 samples/
-*vulnerable*
-*debug*
+*.sarif
+.sast-baseline.json
 
 # Temporary files
 *.bak
+*.tmp
 test-baseline.json
+
+# Python
+__pycache__/
+*.py[cod]
 
 # IDE files
 .vscode/
 *.log
+
+# Node (vscode-extension)
+node_modules/
+*.vsix

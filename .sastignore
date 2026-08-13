@@ -1,19 +1,10 @@
-# CFML SAST Ignore Patterns
-
-# Ignore test files
-*test*
-*/tests/*
-
-# Ignore third-party libraries
-*/vendor/*
-*/lib/*
-
-# Ignore generated files
-*generated*
-*.min.cfm
-*.min.cfc
-
-# Ignore development files
-*debug*
-*temp*
-*.bak
+# Ignore patterns for scanning THIS repository.
+#
+# Intentionally near-empty. The only CFML here lives in tests/fixtures/ and is
+# deliberately vulnerable — the test suite and the CI self-scan job both depend
+# on those files being scanned. Do not add a broad pattern such as `*test*`
+# here: patterns are matched as an unanchored substring against the whole
+# path, so `*test*` would silently disable the entire fixture corpus.
+#
+# For a starter template to drop into your own project, run:
+#     python3 scripts/cfml_sast_simple.py --init-ignore
