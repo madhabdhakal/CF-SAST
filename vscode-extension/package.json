@@ -24,14 +24,16 @@
   ],
   "activationEvents": [
     "onLanguage:cfml",
-    "onCommand:cfmlSast.scanFile",
-    "onCommand:cfmlSast.scanWorkspace",
-    "onCommand:cfmlSast.install",
     "workspaceContains:**/*.cfm",
     "workspaceContains:**/*.cfc",
     "workspaceContains:**/*.cfml"
   ],
   "main": "./extension.js",
+  "scripts": {
+    "test": "node --test test/extension.test.js",
+    "vsix": "npx --yes @vscode/vsce package --no-dependencies",
+    "vsix:publish": "npx --yes @vscode/vsce publish --no-dependencies"
+  },
   "contributes": {
     "commands": [
       {
