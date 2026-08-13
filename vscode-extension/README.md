@@ -1,4 +1,4 @@
-# CFML SAST Scanner
+# CFML Security Scanner
 
 🔒 **Static analysis for ColdFusion (CFML) files, inside VS Code**
 

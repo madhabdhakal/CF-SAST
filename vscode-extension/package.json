@@ -1,6 +1,6 @@
 {
-  "name": "cfml-sast-scanner",
-  "displayName": "CFML SAST Scanner",
+  "name": "cfml-security-scanner",
+  "displayName": "CFML Security Scanner",
   "description": "🔒 SAST scanner for ColdFusion (CFML). 14 rules covering SQL injection, XSS, command execution, unsafe uploads, LDAP injection, XXE and path traversal, across both tag-based and CFScript syntax. Supports SARIF output, baseline suppression and .sastignore patterns.",
   "version": "1.4.1",
   "publisher": "MadhabDhakal",

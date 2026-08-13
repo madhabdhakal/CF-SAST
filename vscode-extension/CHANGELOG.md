@@ -1,12 +1,19 @@
 # Changelog
 
-All notable changes to the CFML SAST Scanner extension.
+All notable changes to the CFML Security Scanner extension.
 
 ## [1.4.1]
 
-Content is identical to 1.4.0, which was never released: an interrupted upload
-reserved that version number on the Marketplace without publishing it, and a
-reserved number cannot be reused.
+**This extension moved to a new Marketplace listing and was renamed** from
+"CFML SAST Scanner" to "CFML Security Scanner". It is now published as
+`MadhabDhakal.cfml-security-scanner`; the previous listing
+(`MadhabDhakal.cfml-sast-scanner`) was removed, and neither its identifier nor
+its display name can be reused. If you installed version 1.3.1 from the old
+listing, uninstall it and install this one — the old entry cannot deliver
+updates.
+
+Code changes below are relative to 1.3.1. (1.4.0 was never released: an
+interrupted upload reserved that version number without publishing it.)
 
 ### Added
 
