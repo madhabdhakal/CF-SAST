@@ -2,7 +2,11 @@
 
 All notable changes to the CFML SAST Scanner extension.
 
-## [1.4.0]
+## [1.4.1]
+
+Content is identical to 1.4.0, which was never released: an interrupted upload
+reserved that version number on the Marketplace without publishing it, and a
+reserved number cannot be reused.
 
 ### Added
 
