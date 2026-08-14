@@ -2,7 +2,7 @@
 
 All notable changes to the CFML Security Scanner extension.
 
-## [1.4.2]
+## [1.4.3]
 
 ### Added
 
@@ -12,6 +12,34 @@ All notable changes to the CFML Security Scanner extension.
   and so on for all 14 rules. Advice supplied by the scanner itself takes
   precedence, so a rule added to a newer scanner explains itself without
   needing an extension update.
+
+- **Scanning works immediately after install.** The scanner now ships inside
+  the extension, so a fresh Marketplace install can scan without first running
+  "Install Git Hooks" or cloning the repository. A copy in the workspace's
+  `CFSAST/` folder still wins when present, so a project pinned to a specific
+  scanner version keeps using it.
+
+### Changed
+
+- **Python is located more reliably.** Instead of assuming one command name,
+  the extension tries the candidates for the platform in order — the `py`
+  launcher first on Windows — and verifies each one actually runs before using
+  it, with a 5-second cap per candidate so an unresponsive entry on `PATH`
+  cannot hang the command. When nothing usable is found, the error says so and
+  offers a link to the Python download page rather than failing silently.
+
+### Fixed
+
+- **"Install Git Hooks" no longer crashes on Windows.** The command runs the
+  installer with its output piped, so Python picked the legacy ANSI codepage
+  (`cp1252`) instead of UTF-8 and died with `UnicodeEncodeError` on the very
+  first line it printed — before doing any work. The extension now runs Python
+  with `PYTHONIOENCODING=utf-8`, and the installer falls back to plain ASCII
+  labels (`[OK]`, `[ERROR]`) when the output stream cannot encode its symbols.
+
+  This fix also shipped in 1.4.2.
+
+## [1.4.2]
 
 ### Fixed
 
