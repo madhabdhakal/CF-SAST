@@ -23,3 +23,9 @@ node_modules/
 # Generated at package time from scripts/cfml_sast_simple.py (single source of
 # truth). See vscode-extension/tools/sync-scanner.js.
 vscode-extension/resources/
+
+# Written by install.py into whichever repo the scanner is installed in --
+# including this one. The contents are downloaded copies of
+# scripts/cfml_sast_simple.py and scripts/sast/*, so committing them here would
+# fork the single source of truth with nothing guarding the drift.
+CFSAST/
