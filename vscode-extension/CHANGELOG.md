@@ -2,6 +2,17 @@
 
 All notable changes to the CFML Security Scanner extension.
 
+## [1.4.2]
+
+### Fixed
+
+- **"Install Git Hooks" no longer crashes on Windows.** The command runs the
+  installer with its output piped, so Python picked the legacy ANSI codepage
+  (`cp1252`) instead of UTF-8 and died with `UnicodeEncodeError` on the very
+  first line it printed — before doing any work. The extension now runs Python
+  with `PYTHONIOENCODING=utf-8`, and the installer falls back to plain ASCII
+  labels (`[OK]`, `[ERROR]`) when the output stream cannot encode its symbols.
+
 ## [1.4.1]
 
 **This extension moved to a new Marketplace listing and was renamed** from
