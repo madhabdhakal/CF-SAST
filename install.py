@@ -5,6 +5,28 @@ import subprocess
 import shutil
 from pathlib import Path
 
+# Emoji crash the installer when stdout is a legacy codepage (VS Code runs it
+# through a pipe, which on Windows means cp1252 and a UnicodeEncodeError).
+# Print them only when the stream can actually encode them.
+_ASCII_FALLBACKS = {
+    '\U0001f527 ': '',         # wrench
+    '\U0001f4cb ': '',         # clipboard
+    '✅': '[OK]',
+    '❌': '[ERROR]',
+    '⚠️': '[WARN]',
+    'ℹ️': '[INFO]',
+}
+
+def say(message=''):
+    encoding = getattr(sys.stdout, 'encoding', None) or 'ascii'
+    try:
+        message.encode(encoding)
+    except UnicodeEncodeError:
+        for char, replacement in _ASCII_FALLBACKS.items():
+            message = message.replace(char, replacement)
+        message = message.encode('ascii', 'replace').decode('ascii')
+    print(message)
+
 def run_cmd(cmd_list, cwd=None):
     try:
         # Use list format to prevent injection
@@ -14,11 +36,11 @@ def run_cmd(cmd_list, cwd=None):
         return False, "", str(e)
 
 def install_cfml_sast():
-    print("🔧 Installing CFML SAST Scanner...")
+    say("🔧 Installing CFML SAST Scanner...")
     
     # Create CFSAST directory
     os.makedirs('CFSAST', exist_ok=True)
-    print("✅ Created CFSAST folder")
+    say("✅ Created CFSAST folder")
     
     # Create Git hooks directory if Git repo exists
     if Path('.git').exists():
@@ -73,7 +95,7 @@ def install_cfml_sast():
             'CFSAST/cfml_sast_simple.py',
             expected_hashes['cfml_sast_simple.py']
         )
-        print("✅ Downloaded CFML SAST scanner to CFSAST/")
+        say("✅ Downloaded CFML SAST scanner to CFSAST/")
         
         # Download secure prepush scripts
         secure_download(
@@ -86,18 +108,18 @@ def install_cfml_sast():
             'CFSAST/prepush.bat',
             expected_hashes['prepush.bat']
         )
-        print("✅ Downloaded secure prepush scripts")
+        say("✅ Downloaded secure prepush scripts")
         
     except urllib.error.URLError as e:
-        print(f"❌ Network error: {e}")
-        print("Please check your internet connection and try again")
+        say(f"❌ Network error: {e}")
+        say("Please check your internet connection and try again")
         return False
     except ssl.SSLError as e:
-        print(f"❌ SSL verification failed: {e}")
-        print("This could indicate a security issue - aborting installation")
+        say(f"❌ SSL verification failed: {e}")
+        say("This could indicate a security issue - aborting installation")
         return False
     except Exception as e:
-        print(f"❌ Download failed: {e}")
+        say(f"❌ Download failed: {e}")
         return False
     
     # Create pre-push hook if Git repo exists.
@@ -127,24 +149,24 @@ exec ./CFSAST/prepush.sh "$@"
             try:
                 path.chmod(0o755)
             except OSError as e:
-                print(f"⚠️  Could not set executable bit on {path}: {e}")
+                say(f"⚠️  Could not set executable bit on {path}: {e}")
 
-        print("✅ Installed pre-push hook at .git/hooks/pre-push")
+        say("✅ Installed pre-push hook at .git/hooks/pre-push")
     else:
-        print("ℹ️ No Git repository found - skipping Git hooks")
+        say("ℹ️ No Git repository found - skipping Git hooks")
     
     # Verify installation
     if Path('CFSAST/cfml_sast_simple.py').exists():
-        print("✅ Installation successful!")
-        print("\n📋 Usage:")
-        print("py -3 CFSAST/cfml_sast_simple.py --files *.cfm *.cfc")
-        print("py -3 CFSAST/cfml_sast_simple.py --init-ignore  # Create .sastignore")
+        say("✅ Installation successful!")
+        say("\n📋 Usage:")
+        say("py -3 CFSAST/cfml_sast_simple.py --files *.cfm *.cfc")
+        say("py -3 CFSAST/cfml_sast_simple.py --init-ignore  # Create .sastignore")
         if Path('.git').exists():
-            print("\n📋 Git integration:")
-            print("git push  # Scanner will run automatically with secure scripts")
+            say("\n📋 Git integration:")
+            say("git push  # Scanner will run automatically with secure scripts")
         return True
     else:
-        print("❌ Installation failed - scanner file not found")
+        say("❌ Installation failed - scanner file not found")
         return False
 
 if __name__ == '__main__':

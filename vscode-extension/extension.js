@@ -593,9 +593,14 @@ function activate(context) {
                 const pythonCmd = pythonCommands[commandIndex];
                 commandIndex++;
                 
+                // PYTHONIOENCODING is required: stdout is a pipe here, so
+                // Python falls back to the ANSI codepage (cp1252 on most
+                // Windows installs) and the installer's non-ASCII output
+                // raises UnicodeEncodeError before it does any work.
                 const pythonProcess = spawn(pythonCmd, ['-c', script], {
                     cwd: workspacePath,
-                    stdio: ['ignore', 'pipe', 'pipe']
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                    env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
                 });
                 
                 let stdout = '';
