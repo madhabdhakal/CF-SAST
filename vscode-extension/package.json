@@ -31,7 +31,11 @@
   "main": "./extension.js",
   "scripts": {
     "test": "node --test test/extension.test.js",
+    "sync-scanner": "node tools/sync-scanner.js",
+    "pretest": "node tools/sync-scanner.js",
+    "prevsix": "node tools/sync-scanner.js",
     "vsix": "npx --yes @vscode/vsce package --no-dependencies",
+    "prevsix:publish": "node tools/sync-scanner.js",
     "vsix:publish": "npx --yes @vscode/vsce publish --no-dependencies"
   },
   "contributes": {

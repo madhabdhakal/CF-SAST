@@ -19,3 +19,7 @@ __pycache__/
 # Node (vscode-extension)
 node_modules/
 *.vsix
+
+# Generated at package time from scripts/cfml_sast_simple.py (single source of
+# truth). See vscode-extension/tools/sync-scanner.js.
+vscode-extension/resources/

@@ -11,4 +11,5 @@ vsc-extension-quickstart.md
 .github/**
 test/**
 src/**
+tools/**
 *.vsix

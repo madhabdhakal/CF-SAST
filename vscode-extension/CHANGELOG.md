@@ -4,6 +4,15 @@ All notable changes to the CFML Security Scanner extension.
 
 ## [1.4.2]
 
+### Added
+
+- **Every finding now shows how to fix it.** Each card carries a short
+  remediation note and the safe form of the construct — `<cfqueryparam>` for
+  SQL injection, `encodeForHTML()` for XSS, an `accept` allow-list for uploads,
+  and so on for all 14 rules. Advice supplied by the scanner itself takes
+  precedence, so a rule added to a newer scanner explains itself without
+  needing an extension update.
+
 ### Fixed
 
 - **"Install Git Hooks" no longer crashes on Windows.** The command runs the
